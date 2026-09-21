@@ -1,5 +1,6 @@
 import logging
 import os
+import re
 
 from openai import AsyncOpenAI
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
@@ -12,11 +13,6 @@ from telegram.ext import (
     filters,
 )
 
-
-# --------------------------------------------------
-# ЛОГИ
-# --------------------------------------------------
-
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     level=logging.INFO,
@@ -28,15 +24,13 @@ logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
 
 
-# --------------------------------------------------
-# ПЕРЕМЕННЫЕ ОКРУЖЕНИЯ
-# --------------------------------------------------
+TELEGRAM_TOKEN = "".join(
+    os.environ.get("TELEGRAM_BOT_TOKEN", "").split()
+)
 
-RAW_TELEGRAM_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
-TELEGRAM_TOKEN = "".join(RAW_TELEGRAM_TOKEN.split())
-
-RAW_OPENAI_KEY = os.environ.get("OPENAI_API_KEY", "")
-OPENAI_API_KEY = "".join(RAW_OPENAI_KEY.split())
+OPENAI_API_KEY = "".join(
+    os.environ.get("OPENAI_API_KEY", "").split()
+)
 
 PORT = int(os.environ.get("PORT", "10000"))
 
@@ -45,10 +39,6 @@ RENDER_EXTERNAL_URL = os.environ.get(
     "",
 ).strip().rstrip("/")
 
-
-# --------------------------------------------------
-# OPENAI
-# --------------------------------------------------
 
 MODEL = "gpt-5.6-luna"
 
@@ -60,84 +50,250 @@ openai_client = AsyncOpenAI(
 BASE_INSTRUCTIONS = """
 Ты — христианский помощник проекта «Библия отвечает».
 
-Твоя задача — помогать людям понимать жизненные ситуации
+Помогай человеку рассматривать жизненные вопросы
 в свете Священного Писания.
 
 Правила:
 
 1. Отвечай на языке пользователя.
-2. Основа ответа — Библия, а не личные откровения,
-   пророчества или выдуманные слова от имени Бога.
-3. Никогда не говори: «Бог сказал мне о вас»,
-   «Бог гарантирует» или подобные утверждения.
-4. Не придумывай ссылки на Библию.
-5. Указывай только те книги, главы и стихи,
-   в которых уверен.
-6. Если не уверен в точной формулировке стиха,
-   передавай смысл своими словами, а не выдавай
-   неточную цитату за дословную.
-7. Не осуждай человека и не манипулируй страхом.
-8. Ответ должен быть доброжелательным,
-   ясным и практически полезным.
-9. Обычно используй 2–4 подходящих места Писания.
-10. Ответ должен быть достаточно кратким для Telegram.
-11. Если речь идёт о здоровье, не обещай исцеление
-    и не советуй отказываться от медицинской помощи.
-12. Если человек сообщает о непосредственной опасности
-    для себя или другого человека, прежде всего
-    посоветуй обратиться за экстренной помощью
-    и к человеку, которому он доверяет.
+
+2. Основа ответа — Библия.
+
+3. Не выдавай свои мысли
+за прямое откровение от Бога.
+
+4. Не говори:
+«Бог сказал мне о вас»,
+«Бог гарантирует»
+или подобных фраз.
+
+5. Не придумывай библейские ссылки.
+
+6. Используй только те книги,
+главы и стихи, в которых уверен.
+
+7. Если не уверен в дословной цитате,
+передавай смысл стиха своими словами,
+а не выдавай неточную формулировку
+за дословную цитату.
+
+8. Не осуждай человека
+и не манипулируй страхом.
+
+9. Обычно используй
+2–4 подходящих места Писания.
+
+10. Пиши ясно, содержательно
+и достаточно кратко для Telegram.
+
+11. При вопросах о здоровье
+не обещай гарантированное исцеление
+и не советуй отказываться
+от медицинской помощи.
+
+12. При непосредственной опасности
+для человека или окружающих
+сначала советуй обратиться
+за экстренной помощью
+и к человеку, которому пользователь доверяет.
+
+Формат:
+
+13. Пиши обычным текстом
+без Markdown-разметки.
+
+14. Не используй звёздочки
+для жирного текста,
+решётки для заголовков,
+обратные кавычки
+и подчёркивания для курсива.
+
+15. Для пунктов списка
+используй только символ •.
+
+16. Делай короткие абзацы.
+
+17. Между смысловыми разделами
+оставляй одну пустую строку.
+
+18. Названия смысловых разделов
+можно начинать с эмодзи.
 """
 
 
 MODE_INSTRUCTIONS = {
     "ask": """
-Ответь на вопрос пользователя на основании Библии.
+Ответь на вопрос
+на основании Библии.
 
 Структура:
-1. Короткий прямой ответ.
-2. 2–4 подходящих места Писания с объяснением,
-   как они относятся к ситуации.
-3. Один практический шаг, который человек
-   может сделать сегодня.
-4. Короткое ободрение.
 
-Не составляй молитву, если пользователь
-сам её не просил.
+📖 Библейский взгляд
+
+Короткий прямой ответ.
+
+📚 Места Писания
+
+Приведи 2–4 подходящих места.
+
+Каждый пункт оформляй так:
+
+• Матфея 6:34 — краткое объяснение,
+как этот стих относится к ситуации.
+
+✅ Практический шаг
+
+Один конкретный шаг,
+который человек может сделать сегодня.
+
+💬 Ободрение
+
+Короткое библейское ободрение.
+
+Не добавляй молитву,
+если пользователь её не просил.
 """,
 
     "prayer": """
 Пользователь просит молитву по нужде.
 
-Составь:
-1. Короткое библейское ободрение.
-2. 1–3 подходящих ссылки на Писание.
-3. Искреннюю христианскую молитву по описанной нужде.
+Структура:
 
-Не обещай конкретного сверхъестественного результата
+📖 Библейское ободрение
+
+Короткая поддержка.
+
+📚 Места Писания
+
+Приведи 1–3 подходящих места.
+
+Каждый пункт оформляй так:
+
+• Филиппийцам 4:6–7 —
+краткое пояснение.
+
+🙏 Молитва
+
+Составь искреннюю
+христианскую молитву
+по описанной нужде.
+
+Не обещай конкретного
+сверхъестественного результата
 и не говори от имени Бога.
 """,
 
     "healing": """
-Пользователь просит молитву об исцелении.
+Пользователь просит
+молитву об исцелении.
 
-Составь:
-1. Сочувственный и спокойный ответ.
-2. 1–3 подходящих места Писания о молитве,
-   надежде, Божьей помощи и поддержке.
-3. Короткую молитву об исцелении,
-   укреплении и мудрости.
+Структура:
 
-Не утверждай, что человек обязательно будет исцелён.
-Не советуй прекращать лечение или игнорировать врача.
+❤️ Поддержка
+
+Спокойный и сочувственный ответ.
+
+📚 Места Писания
+
+Приведи 1–3 подходящих места
+о молитве, надежде
+и Божьей поддержке.
+
+🙏 Молитва
+
+Составь короткую молитву
+об исцелении,
+укреплении и мудрости.
+
+Не утверждай,
+что человек обязательно будет исцелён.
+
+Не советуй прекращать лечение
+или игнорировать врача.
 """,
 }
+
+
+def clean_ai_text(text: str) -> str:
+    text = (
+        text.replace("\r\n", "\n")
+        .replace("\r", "\n")
+        .strip()
+    )
+
+    text = re.sub(
+        r"```(?:[a-zA-Z0-9_-]+)?\n?",
+        "",
+        text,
+    )
+
+    text = text.replace("```", "")
+    text = text.replace("`", "")
+
+    text = re.sub(
+        r"\*\*(.*?)\*\*",
+        r"\1",
+        text,
+        flags=re.DOTALL,
+    )
+
+    text = re.sub(
+        r"__(.*?)__",
+        r"\1",
+        text,
+        flags=re.DOTALL,
+    )
+
+    text = re.sub(
+        r"(?<!\*)\*([^*\n]+)\*(?!\*)",
+        r"\1",
+        text,
+    )
+
+    text = re.sub(
+        r"(?<!_)_([^_\n]+)_(?!_)",
+        r"\1",
+        text,
+    )
+
+    text = re.sub(
+        r"(?m)^\s{0,3}#{1,6}\s*",
+        "",
+        text,
+    )
+
+    text = re.sub(
+        r"(?m)^\s*[-+*]\s+",
+        "• ",
+        text,
+    )
+
+    text = re.sub(
+        r"\[([^\]]+)\]\(([^)]+)\)",
+        r"\1 (\2)",
+        text,
+    )
+
+    text = re.sub(
+        r"(?m)^\s*[-_*]{3,}\s*$",
+        "",
+        text,
+    )
+
+    text = re.sub(
+        r"\n{3,}",
+        "\n\n",
+        text,
+    )
+
+    return text.strip()
 
 
 async def generate_ai_answer(
     user_text: str,
     mode: str,
 ) -> str:
+
     instructions = (
         BASE_INSTRUCTIONS
         + "\n"
@@ -154,7 +310,9 @@ async def generate_ai_answer(
         max_output_tokens=700,
     )
 
-    answer = response.output_text.strip()
+    answer = clean_ai_text(
+        response.output_text or ""
+    )
 
     if not answer:
         return (
@@ -165,81 +323,69 @@ async def generate_ai_answer(
     return answer
 
 
-# --------------------------------------------------
-# TELEGRAM — МЕНЮ
-# --------------------------------------------------
+def main_menu() -> InlineKeyboardMarkup:
 
-def main_menu():
-    keyboard = [
+    return InlineKeyboardMarkup(
         [
-            InlineKeyboardButton(
-                "📖 Задать вопрос Библии",
-                callback_data="ask",
-            )
-        ],
-        [
-            InlineKeyboardButton(
-                "🙏 Молитва по нужде",
-                callback_data="prayer",
-            )
-        ],
-        [
-            InlineKeyboardButton(
-                "❤️‍🩹 Молитва об исцелении",
-                callback_data="healing",
-            )
-        ],
-        [
-            InlineKeyboardButton(
-                "📖 Стих из Библии",
-                callback_data="verse",
-            )
-        ],
-        [
-            InlineKeyboardButton(
-                "🤝 Поддержать проект",
-                callback_data="donate",
-            )
-        ],
-        [
-            InlineKeyboardButton(
-                "ℹ️ О проекте",
-                callback_data="about",
-            )
-        ],
-    ]
+            [
+                InlineKeyboardButton(
+                    "📖 Задать вопрос Библии",
+                    callback_data="ask",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    "🙏 Молитва по нужде",
+                    callback_data="prayer",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    "❤️‍🩹 Молитва об исцелении",
+                    callback_data="healing",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    "📖 Стих из Библии",
+                    callback_data="verse",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    "🤝 Поддержать проект",
+                    callback_data="donate",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    "ℹ️ О проекте",
+                    callback_data="about",
+                )
+            ],
+        ]
+    )
 
-    return InlineKeyboardMarkup(keyboard)
-
-
-# --------------------------------------------------
-# ДЛИННЫЕ СООБЩЕНИЯ
-# --------------------------------------------------
 
 async def send_long_message(
     update: Update,
     text: str,
-):
+) -> None:
+
     message = update.effective_message
 
     if not message:
         return
 
     max_length = 3800
-
-    if len(text) <= max_length:
-        await message.reply_text(
-            text,
-            reply_markup=main_menu(),
-        )
-        return
-
-    remaining = text
+    remaining = text.strip()
 
     while remaining:
+
         if len(remaining) <= max_length:
             chunk = remaining
             remaining = ""
+
         else:
             split_at = remaining.rfind(
                 "\n",
@@ -250,26 +396,32 @@ async def send_long_message(
             if split_at < 1000:
                 split_at = max_length
 
-            chunk = remaining[:split_at]
-            remaining = remaining[split_at:].lstrip()
+            chunk = remaining[:split_at].strip()
+
+            remaining = (
+                remaining[split_at:]
+                .lstrip()
+            )
 
         if remaining:
-            await message.reply_text(chunk)
+
+            await message.reply_text(
+                chunk
+            )
+
         else:
+
             await message.reply_text(
                 chunk,
                 reply_markup=main_menu(),
             )
 
 
-# --------------------------------------------------
-# /START
-# --------------------------------------------------
-
 async def start(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
-):
+) -> None:
+
     context.user_data.clear()
 
     text = (
@@ -288,14 +440,11 @@ async def start(
     )
 
 
-# --------------------------------------------------
-# КНОПКИ
-# --------------------------------------------------
-
 async def button_handler(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
-):
+) -> None:
+
     query = update.callback_query
 
     await query.answer()
@@ -303,65 +452,82 @@ async def button_handler(
     action = query.data
 
     if action == "ask":
+
         context.user_data["mode"] = "ask"
 
         text = (
             "📖 <b>Задайте вопрос</b>\n\n"
-            "Напишите своими словами, что произошло, "
-            "что вас тревожит или в чём вы хотите "
-            "получить ответ на основании Библии."
+            "Напишите своими словами, "
+            "что произошло, "
+            "что вас тревожит "
+            "или в чём вы хотите "
+            "получить ответ "
+            "на основании Библии."
         )
 
     elif action == "prayer":
+
         context.user_data["mode"] = "prayer"
 
         text = (
             "🙏 <b>Молитва по нужде</b>\n\n"
-            "Напишите вашу нужду своими словами, "
+            "Напишите вашу нужду "
+            "своими словами, "
             "и бот поможет составить молитву "
             "на основании Писания."
         )
 
     elif action == "healing":
+
         context.user_data["mode"] = "healing"
 
         text = (
             "❤️‍🩹 <b>Молитва об исцелении</b>\n\n"
-            "Напишите, о ком вы хотите молиться "
+            "Напишите, "
+            "о ком вы хотите молиться "
             "и в чём состоит нужда."
         )
 
     elif action == "verse":
+
         context.user_data.clear()
 
         text = (
-            "📖 «Слово Твоё — светильник ноге моей "
+            "📖 «Слово Твоё — "
+            "светильник ноге моей "
             "и свет стезе моей».\n\n"
             "Псалом 118:105"
         )
 
     elif action == "donate":
+
         context.user_data.clear()
 
         text = (
             "🤝 <b>Поддержать проект</b>\n\n"
             "Здесь позже появится возможность "
-            "добровольно поддержать развитие проекта."
+            "добровольно поддержать "
+            "развитие проекта."
         )
 
     elif action == "about":
+
         context.user_data.clear()
 
         text = (
             "ℹ️ <b>О проекте</b>\n\n"
-            "«Библия отвечает» — христианский "
-            "AI-помощник для поиска библейского "
-            "взгляда на жизненные вопросы, молитвенной "
-            "поддержки и ободрения."
+            "«Библия отвечает» — "
+            "христианский AI-помощник "
+            "для поиска библейского взгляда "
+            "на жизненные вопросы, "
+            "молитвенной поддержки "
+            "и ободрения."
         )
 
     else:
+
         context.user_data.clear()
+
         text = "Выберите нужный раздел:"
 
     await query.message.reply_text(
@@ -371,29 +537,38 @@ async def button_handler(
     )
 
 
-# --------------------------------------------------
-# СООБЩЕНИЯ ПОЛЬЗОВАТЕЛЯ
-# --------------------------------------------------
-
 async def text_handler(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
-):
-    if not update.message or not update.message.text:
+) -> None:
+
+    if (
+        not update.message
+        or not update.message.text
+    ):
         return
 
-    user_text = update.message.text.strip()
+    user_text = (
+        update.message.text.strip()
+    )
 
     if not user_text:
         return
 
-    mode = context.user_data.get("mode", "ask")
+    mode = context.user_data.get(
+        "mode",
+        "ask",
+    )
 
-    wait_message = await update.message.reply_text(
-        "⏳ Подбираю ответ на основании Писания..."
+    wait_message = (
+        await update.message.reply_text(
+            "⏳ Подбираю ответ "
+            "на основании Писания..."
+        )
     )
 
     try:
+
         answer = await generate_ai_answer(
             user_text=user_text,
             mode=mode,
@@ -401,6 +576,7 @@ async def text_handler(
 
         try:
             await wait_message.delete()
+
         except Exception:
             pass
 
@@ -412,26 +588,27 @@ async def text_handler(
         context.user_data.clear()
 
     except Exception:
+
         logger.exception(
-            "Ошибка при обращении к OpenAI API"
+            "Ошибка при обращении "
+            "к OpenAI API"
         )
 
         try:
+
             await wait_message.edit_text(
-                "⚠️ Сейчас не удалось получить "
-                "AI-ответ.\n\n"
+                "⚠️ Сейчас не удалось "
+                "получить AI-ответ.\n\n"
                 "Попробуйте отправить сообщение "
                 "ещё раз через несколько секунд."
             )
+
         except Exception:
             pass
 
 
-# --------------------------------------------------
-# ЗАПУСК
-# --------------------------------------------------
+def main() -> None:
 
-def main():
     if not TELEGRAM_TOKEN:
         raise RuntimeError(
             "TELEGRAM_BOT_TOKEN не установлен"
@@ -439,7 +616,8 @@ def main():
 
     if ":" not in TELEGRAM_TOKEN:
         raise RuntimeError(
-            "TELEGRAM_BOT_TOKEN имеет неверный формат"
+            "TELEGRAM_BOT_TOKEN "
+            "имеет неверный формат"
         )
 
     if not OPENAI_API_KEY:
@@ -473,7 +651,8 @@ def main():
 
     application.add_handler(
         MessageHandler(
-            filters.TEXT & ~filters.COMMAND,
+            filters.TEXT
+            & ~filters.COMMAND,
             text_handler,
         )
     )
@@ -497,5 +676,4 @@ def main():
     )
 
 
-if __name__ == "__main__":
-    main()
+main()
