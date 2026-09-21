@@ -18,6 +18,8 @@ logging.basicConfig(
 )
 
 logger = logging.getLogger(__name__)
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
 
 # Секретный токен будет храниться в Render, а не в GitHub
 TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
