@@ -3,7 +3,7 @@ import os
 import random
 import re
 from decimal import Decimal, InvalidOperation
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import httpx
 from openai import AsyncOpenAI
@@ -45,8 +45,26 @@ SUPABASE_SECRET_KEY = "".join(
 )
 
 SUPABASE_TABLE = "bible_bot_user_state"
+ANALYTICS_USERS_TABLE = "bible_bot_users"
+ANALYTICS_EVENTS_TABLE = "bible_bot_events"
 SUPABASE_TIMEOUT_SECONDS = 10.0
 OPENAI_TIMEOUT_SECONDS = 120.0
+
+TELEGRAM_ADMIN_ID_RAW = "".join(
+    os.environ.get("TELEGRAM_ADMIN_ID", "").split()
+)
+
+try:
+    TELEGRAM_ADMIN_ID = (
+        int(TELEGRAM_ADMIN_ID_RAW)
+        if TELEGRAM_ADMIN_ID_RAW
+        else None
+    )
+except ValueError:
+    TELEGRAM_ADMIN_ID = None
+    logger.warning(
+        "TELEGRAM_ADMIN_ID имеет неверный формат"
+    )
 
 PORT = int(os.environ.get("PORT", "10000"))
 
@@ -1466,6 +1484,683 @@ def supabase_headers() -> dict[str, str]:
     }
 
 
+
+def normalize_start_source(
+    context: ContextTypes.DEFAULT_TYPE,
+) -> str:
+    if not context.args:
+        return "direct"
+
+    raw_source = context.args[0].strip().lower()
+
+    if not re.fullmatch(
+        r"[a-z0-9_-]{1,64}",
+        raw_source,
+    ):
+        return "other"
+
+    return raw_source
+
+
+def analytics_event_for_action(
+    action: str,
+) -> str:
+    if action.startswith("don_amt_"):
+        parts = action.split("_")
+
+        if len(parts) >= 3:
+            return (
+                "donation_amount_"
+                + parts[2].lower()
+            )
+
+    if action.startswith("don_custom_"):
+        return (
+            "donation_custom_"
+            + action.replace(
+                "don_custom_",
+                "",
+            ).lower()
+        )
+
+    if action.startswith("don_details_"):
+        return (
+            "donation_details_"
+            + action.replace(
+                "don_details_",
+                "",
+            ).lower()
+        )
+
+    aliases = {
+        "donate": "donation_open",
+        "donate_uah": "donation_currency_uah",
+        "donate_eur": "donation_currency_eur",
+        "donate_usd": "donation_currency_usd",
+        "donate_usdt": "donation_currency_usdt",
+        "ask": "menu_ask",
+        "prayer": "menu_prayer",
+        "healing": "menu_healing",
+        "finances": "menu_finances",
+        "blessing": "menu_blessing",
+        "verse": "menu_verse",
+        "about": "menu_about",
+        "menu": "menu_home",
+    }
+
+    return aliases.get(
+        action,
+        "button_other",
+    )
+
+
+async def analytics_get_user(
+    telegram_user_id: int,
+) -> dict | None:
+    if not supabase_is_configured():
+        return None
+
+    url = (
+        f"{SUPABASE_URL}/rest/v1/"
+        f"{ANALYTICS_USERS_TABLE}"
+    )
+
+    params = {
+        "telegram_user_id": (
+            f"eq.{telegram_user_id}"
+        ),
+        "select": (
+            "telegram_user_id,first_seen_at,"
+            "last_seen_at,source,start_count"
+        ),
+        "limit": "1",
+    }
+
+    try:
+        async with httpx.AsyncClient(
+            timeout=SUPABASE_TIMEOUT_SECONDS,
+        ) as client:
+            response = await client.get(
+                url,
+                headers=supabase_headers(),
+                params=params,
+            )
+            response.raise_for_status()
+
+        rows = response.json()
+
+        if not rows:
+            return None
+
+        return rows[0]
+
+    except (
+        httpx.TimeoutException,
+        httpx.NetworkError,
+        httpx.HTTPStatusError,
+        ValueError,
+    ):
+        logger.exception(
+            "Не удалось прочитать пользователя аналитики"
+        )
+        return None
+
+
+async def analytics_track_start(
+    telegram_user_id: int,
+    source: str,
+) -> None:
+    if not supabase_is_configured():
+        return
+
+    now = datetime.now(
+        timezone.utc
+    ).isoformat()
+
+    existing = await analytics_get_user(
+        telegram_user_id
+    )
+
+    url = (
+        f"{SUPABASE_URL}/rest/v1/"
+        f"{ANALYTICS_USERS_TABLE}"
+    )
+
+    try:
+        async with httpx.AsyncClient(
+            timeout=SUPABASE_TIMEOUT_SECONDS,
+        ) as client:
+            if existing is None:
+                payload = {
+                    "telegram_user_id": telegram_user_id,
+                    "first_seen_at": now,
+                    "last_seen_at": now,
+                    "source": source,
+                    "start_count": 1,
+                }
+
+                response = await client.post(
+                    url,
+                    headers=supabase_headers(),
+                    json=payload,
+                )
+            else:
+                current_count = existing.get(
+                    "start_count",
+                    0,
+                )
+
+                if not isinstance(
+                    current_count,
+                    int,
+                ):
+                    current_count = 0
+
+                params = {
+                    "telegram_user_id": (
+                        f"eq.{telegram_user_id}"
+                    ),
+                }
+
+                payload = {
+                    "last_seen_at": now,
+                    "start_count": (
+                        current_count + 1
+                    ),
+                }
+
+                response = await client.patch(
+                    url,
+                    headers=supabase_headers(),
+                    params=params,
+                    json=payload,
+                )
+
+            response.raise_for_status()
+
+    except (
+        httpx.TimeoutException,
+        httpx.NetworkError,
+        httpx.HTTPStatusError,
+    ):
+        logger.exception(
+            "Не удалось сохранить старт пользователя "
+            "в аналитике"
+        )
+
+
+async def analytics_touch_user(
+    telegram_user_id: int,
+) -> None:
+    if not supabase_is_configured():
+        return
+
+    url = (
+        f"{SUPABASE_URL}/rest/v1/"
+        f"{ANALYTICS_USERS_TABLE}"
+    )
+
+    params = {
+        "telegram_user_id": (
+            f"eq.{telegram_user_id}"
+        ),
+    }
+
+    payload = {
+        "last_seen_at": datetime.now(
+            timezone.utc
+        ).isoformat(),
+    }
+
+    try:
+        async with httpx.AsyncClient(
+            timeout=SUPABASE_TIMEOUT_SECONDS,
+        ) as client:
+            response = await client.patch(
+                url,
+                headers=supabase_headers(),
+                params=params,
+                json=payload,
+            )
+            response.raise_for_status()
+
+    except (
+        httpx.TimeoutException,
+        httpx.NetworkError,
+        httpx.HTTPStatusError,
+    ):
+        logger.exception(
+            "Не удалось обновить активность пользователя"
+        )
+
+
+async def analytics_log_event(
+    telegram_user_id: int,
+    event_name: str,
+) -> None:
+    if not supabase_is_configured():
+        return
+
+    safe_event = re.sub(
+        r"[^a-z0-9_-]",
+        "_",
+        event_name.lower(),
+    )[:80]
+
+    url = (
+        f"{SUPABASE_URL}/rest/v1/"
+        f"{ANALYTICS_EVENTS_TABLE}"
+    )
+
+    payload = {
+        "telegram_user_id": telegram_user_id,
+        "event_name": safe_event,
+        "created_at": datetime.now(
+            timezone.utc
+        ).isoformat(),
+    }
+
+    try:
+        async with httpx.AsyncClient(
+            timeout=SUPABASE_TIMEOUT_SECONDS,
+        ) as client:
+            response = await client.post(
+                url,
+                headers=supabase_headers(),
+                json=payload,
+            )
+            response.raise_for_status()
+
+    except (
+        httpx.TimeoutException,
+        httpx.NetworkError,
+        httpx.HTTPStatusError,
+    ):
+        logger.exception(
+            "Не удалось записать событие аналитики"
+        )
+
+
+async def analytics_activity(
+    telegram_user_id: int,
+    event_name: str,
+) -> None:
+    await analytics_touch_user(
+        telegram_user_id
+    )
+    await analytics_log_event(
+        telegram_user_id,
+        event_name,
+    )
+
+
+async def analytics_exact_count(
+    table: str,
+    filters_map: dict[str, str] | None = None,
+) -> int:
+    if not supabase_is_configured():
+        return 0
+
+    url = (
+        f"{SUPABASE_URL}/rest/v1/"
+        f"{table}"
+    )
+
+    params = {
+        "select": "*",
+        "limit": "1",
+    }
+
+    if filters_map:
+        params.update(
+            filters_map
+        )
+
+    headers = supabase_headers()
+    headers["Prefer"] = "count=exact"
+    headers["Range"] = "0-0"
+
+    try:
+        async with httpx.AsyncClient(
+            timeout=SUPABASE_TIMEOUT_SECONDS,
+        ) as client:
+            response = await client.get(
+                url,
+                headers=headers,
+                params=params,
+            )
+            response.raise_for_status()
+
+        content_range = response.headers.get(
+            "content-range",
+            "",
+        )
+
+        if "/" not in content_range:
+            return 0
+
+        total = content_range.rsplit(
+            "/",
+            1,
+        )[1]
+
+        if total == "*":
+            return 0
+
+        return int(total)
+
+    except (
+        httpx.TimeoutException,
+        httpx.NetworkError,
+        httpx.HTTPStatusError,
+        ValueError,
+    ):
+        logger.exception(
+            "Не удалось получить count аналитики"
+        )
+        return 0
+
+
+async def verify_analytics_connection() -> bool:
+    if not supabase_is_configured():
+        return False
+
+    try:
+        await analytics_exact_count(
+            ANALYTICS_USERS_TABLE
+        )
+        await analytics_exact_count(
+            ANALYTICS_EVENTS_TABLE
+        )
+
+        logger.info(
+            "Analytics подключена: %s, %s",
+            ANALYTICS_USERS_TABLE,
+            ANALYTICS_EVENTS_TABLE,
+        )
+        return True
+
+    except Exception:
+        logger.exception(
+            "Analytics таблицы пока недоступны"
+        )
+        return False
+
+
+def admin_is_configured() -> bool:
+    return TELEGRAM_ADMIN_ID is not None
+
+
+def user_is_admin(
+    update: Update,
+) -> bool:
+    user = update.effective_user
+
+    return bool(
+        user
+        and TELEGRAM_ADMIN_ID is not None
+        and user.id == TELEGRAM_ADMIN_ID
+    )
+
+
+async def require_admin(
+    update: Update,
+) -> bool:
+    if user_is_admin(update):
+        return True
+
+    message = update.effective_message
+
+    if not message:
+        return False
+
+    if not admin_is_configured():
+        user = update.effective_user
+        user_id = (
+            user.id
+            if user
+            else "не определён"
+        )
+
+        await message.reply_text(
+            "🔐 Статистика ещё не привязана "
+            "к владельцу бота.\n\n"
+            f"Ваш Telegram ID: {user_id}\n\n"
+            "Добавьте этот ID в Render "
+            "как переменную TELEGRAM_ADMIN_ID."
+        )
+        return False
+
+    await message.reply_text(
+        "🔐 Эта команда доступна "
+        "только владельцу бота."
+    )
+    return False
+
+
+async def myid_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    user = update.effective_user
+    message = update.effective_message
+
+    if not user or not message:
+        return
+
+    await message.reply_text(
+        "🆔 Ваш Telegram ID:\n"
+        f"{user.id}"
+    )
+
+
+async def links_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    if not await require_admin(update):
+        return
+
+    message = update.effective_message
+
+    if not message:
+        return
+
+    me = await context.bot.get_me()
+
+    if not me.username:
+        await message.reply_text(
+            "Не удалось определить username бота."
+        )
+        return
+
+    base = f"https://t.me/{me.username}"
+
+    text = (
+        "🔗 Ссылки для продвижения\n\n"
+        f"Instagram профиль:\n"
+        f"{base}?start=instagram\n\n"
+        f"Instagram Stories:\n"
+        f"{base}?start=instagram_story\n\n"
+        f"Сайт Bless United:\n"
+        f"{base}?start=blessunited\n\n"
+        f"Facebook:\n"
+        f"{base}?start=facebook\n\n"
+        f"Реклама №1:\n"
+        f"{base}?start=ad_campaign_1\n\n"
+        "Каждая ссылка ведёт в того же бота, "
+        "но источник сохраняется отдельно "
+        "для статистики."
+    )
+
+    await message.reply_text(
+        text
+    )
+
+
+async def stats_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    if not await require_admin(update):
+        return
+
+    message = update.effective_message
+
+    if not message:
+        return
+
+    now = datetime.now(
+        timezone.utc
+    )
+    last_24h = (
+        now - timedelta(hours=24)
+    ).isoformat()
+    last_7d = (
+        now - timedelta(days=7)
+    ).isoformat()
+    last_30d = (
+        now - timedelta(days=30)
+    ).isoformat()
+
+    total_users = await analytics_exact_count(
+        ANALYTICS_USERS_TABLE
+    )
+    new_24h = await analytics_exact_count(
+        ANALYTICS_USERS_TABLE,
+        {
+            "first_seen_at": (
+                f"gte.{last_24h}"
+            )
+        },
+    )
+    new_7d = await analytics_exact_count(
+        ANALYTICS_USERS_TABLE,
+        {
+            "first_seen_at": (
+                f"gte.{last_7d}"
+            )
+        },
+    )
+    new_30d = await analytics_exact_count(
+        ANALYTICS_USERS_TABLE,
+        {
+            "first_seen_at": (
+                f"gte.{last_30d}"
+            )
+        },
+    )
+    active_7d = await analytics_exact_count(
+        ANALYTICS_USERS_TABLE,
+        {
+            "last_seen_at": (
+                f"gte.{last_7d}"
+            )
+        },
+    )
+
+    source_names = [
+        ("Instagram", "instagram"),
+        ("Instagram Stories", "instagram_story"),
+        ("Bless United", "blessunited"),
+        ("Facebook", "facebook"),
+        ("Реклама №1", "ad_campaign_1"),
+        ("Прямой запуск", "direct"),
+    ]
+
+    source_lines = []
+
+    for label, source in source_names:
+        count = await analytics_exact_count(
+            ANALYTICS_USERS_TABLE,
+            {
+                "source": f"eq.{source}"
+            },
+        )
+
+        source_lines.append(
+            f"• {label}: {count}"
+        )
+
+    event_names = [
+        ("Библейские вопросы", "ai_ask"),
+        ("Молитва по нужде", "ai_prayer"),
+        ("Исцеление", "ai_healing"),
+        ("Работа и финансы", "ai_finances"),
+        ("Благословение", "ai_blessing"),
+        ("Стих из Библии", "menu_verse"),
+    ]
+
+    usage_lines = []
+
+    for label, event_name in event_names:
+        count = await analytics_exact_count(
+            ANALYTICS_EVENTS_TABLE,
+            {
+                "event_name": (
+                    f"eq.{event_name}"
+                ),
+                "created_at": (
+                    f"gte.{last_7d}"
+                ),
+            },
+        )
+
+        usage_lines.append(
+            f"• {label}: {count}"
+        )
+
+    donation_lines = []
+
+    for label, event_name in [
+        ("UAH", "donation_currency_uah"),
+        ("EUR", "donation_currency_eur"),
+        ("USD", "donation_currency_usd"),
+        ("USDT", "donation_currency_usdt"),
+    ]:
+        count = await analytics_exact_count(
+            ANALYTICS_EVENTS_TABLE,
+            {
+                "event_name": (
+                    f"eq.{event_name}"
+                ),
+                "created_at": (
+                    f"gte.{last_7d}"
+                ),
+            },
+        )
+
+        donation_lines.append(
+            f"• {label}: {count}"
+        )
+
+    text = (
+        "📊 Статистика «Библия отвечает»\n\n"
+        "👥 Пользователи\n"
+        f"• Всего: {total_users}\n"
+        f"• Новые за 24 часа: {new_24h}\n"
+        f"• Новые за 7 дней: {new_7d}\n"
+        f"• Новые за 30 дней: {new_30d}\n"
+        f"• Активные за 7 дней: {active_7d}\n\n"
+        "📍 Источники\n"
+        + "\n".join(source_lines)
+        + "\n\n"
+        "📖 Использование за 7 дней\n"
+        + "\n".join(usage_lines)
+        + "\n\n"
+        "🤝 Интерес к поддержке за 7 дней\n"
+        + "\n".join(donation_lines)
+        + "\n\n"
+        "Примечание: раздел поддержки показывает "
+        "нажатия на способы пожертвования, "
+        "а не подтверждённые банковские платежи."
+    )
+
+    await message.reply_text(
+        text
+    )
+
+
 def normalize_verse_state(
     raw_queue,
     raw_last_index,
@@ -1919,6 +2614,26 @@ async def start(
         None,
     )
 
+    user = update.effective_user
+
+    if user:
+        source = normalize_start_source(
+            context
+        )
+
+        context.application.create_task(
+            analytics_track_start(
+                user.id,
+                source,
+            )
+        )
+        context.application.create_task(
+            analytics_log_event(
+                user.id,
+                "start",
+            )
+        )
+
     text = (
         "📖 <b>Библия отвечает</b>\n\n"
         "Расскажите, что происходит в вашей жизни, "
@@ -1954,6 +2669,18 @@ async def button_handler(
 
     if not action:
         return
+
+    user = update.effective_user
+
+    if user:
+        context.application.create_task(
+            analytics_activity(
+                user.id,
+                analytics_event_for_action(
+                    action
+                ),
+            )
+        )
 
     if not action.startswith("don_custom_"):
         context.user_data.pop(
@@ -2274,6 +3001,19 @@ async def text_handler(
             None,
         )
 
+        user = update.effective_user
+
+        if user:
+            context.application.create_task(
+                analytics_activity(
+                    user.id,
+                    (
+                        "donation_custom_amount_"
+                        + donation_currency.lower()
+                    ),
+                )
+            )
+
         await update.message.reply_text(
             donation_details_text(
                 donation_currency,
@@ -2291,6 +3031,28 @@ async def text_handler(
         "mode",
         "ask",
     )
+
+    user = update.effective_user
+
+    if user:
+        safe_mode = (
+            mode
+            if mode in {
+                "ask",
+                "prayer",
+                "healing",
+                "finances",
+                "blessing",
+            }
+            else "ask"
+        )
+
+        context.application.create_task(
+            analytics_activity(
+                user.id,
+                f"ai_{safe_mode}",
+            )
+        )
 
     wait_message = (
         await update.message.reply_text(
@@ -2341,6 +3103,7 @@ async def post_init(
     application: Application,
 ) -> None:
     await verify_supabase_connection()
+    await verify_analytics_connection()
 
 
 async def error_handler(
@@ -2430,6 +3193,27 @@ def main() -> None:
         CommandHandler(
             "start",
             start,
+        )
+    )
+
+    application.add_handler(
+        CommandHandler(
+            "myid",
+            myid_command,
+        )
+    )
+
+    application.add_handler(
+        CommandHandler(
+            "stats",
+            stats_command,
+        )
+    )
+
+    application.add_handler(
+        CommandHandler(
+            "links",
+            links_command,
         )
     )
 
