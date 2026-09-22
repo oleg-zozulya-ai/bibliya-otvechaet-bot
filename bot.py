@@ -892,33 +892,55 @@ async def generate_ai_answer(
     user_text: str,
     mode: str,
 ) -> str:
+    mode_instruction = MODE_INSTRUCTIONS.get(
+        mode,
+        MODE_INSTRUCTIONS["ask"],
+    )
+
+    if mode == "ask":
+        mode_instruction += """
+
+ВАЖНО О ДЛИНЕ И СТРУКТУРЕ ОТВЕТА:
+
+Обычный ответ на библейский вопрос должен быть глубоким,
+но компактным и удобным для чтения в Telegram.
+
+Ориентируйся примерно на 450–650 слов.
+
+Не повторяй одну и ту же мысль разными словами.
+Не растягивай вступление.
+Не создавай лишние разделы только ради объёма.
+
+Выбери самые сильные и непосредственно относящиеся
+к вопросу места Писания.
+
+Обычно достаточно:
+• ясного библейского объяснения;
+• 2–4 ключевых мест Писания;
+• одного действительно глубокого духовного принципа;
+• 1–3 практических шагов;
+• короткого провозглашения, если оно уместно;
+• завершённого Христоцентричного ободрения.
+
+Каждый раздел должен добавлять новую мысль,
+а не повторять предыдущий.
+
+ОБЯЗАТЕЛЬНО доводи ответ до логического завершения.
+Никогда не заканчивай ответ на незаконченной фразе,
+незавершённом списке или посреди раздела.
+"""
+
     instructions = (
         BASE_INSTRUCTIONS
         + "\n"
-        + MODE_INSTRUCTIONS.get(
-            mode,
-            MODE_INSTRUCTIONS["ask"],
-        )
-    )
-
-    max_tokens_by_mode = {
-        "ask": 1600,
-        "prayer": 3000,
-        "healing": 3000,
-        "finances": 3000,
-        "blessing": 3000,
-    }
-
-    max_output_tokens = max_tokens_by_mode.get(
-        mode,
-        1600,
+        + mode_instruction
     )
 
     response = await openai_client.responses.create(
         model=MODEL,
         instructions=instructions,
         input=user_text,
-        max_output_tokens=max_output_tokens,
+        max_output_tokens=3000,
     )
 
     answer = clean_ai_text(
@@ -932,6 +954,7 @@ async def generate_ai_answer(
         )
 
     return answer
+
 
 def main_menu() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
