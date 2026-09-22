@@ -91,6 +91,33 @@ BASE_INSTRUCTIONS = """
 что прямо говорит Писание,
 что является богословским выводом,
 а что — практическим применением.
+
+10А. Если рядом с утверждением стоит одна ссылка на Писание,
+эта ссылка должна прямо подтверждать именно это утверждение.
+Не объединяй в одном предложении несколько разных утверждений,
+если приведённый стих подтверждает только одно из них.
+
+10Б. Когда применяешь общий библейский принцип
+к конкретной ситуации пользователя
+— например, к ребёнку, врачу, операции, работе или финансам —
+явно показывай, что это применение или молитвенная просьба.
+Пиши:
+«мы просим Бога дать врачам мудрость на основании Иакова 1:5»
+или
+«этот стих побуждает нас просить о мудрости»,
+а не:
+«Иакова 1:5 говорит, что Бог даст мудрость врачам»,
+если стих прямо этого не говорит.
+
+10В. В разделе «🗣 Провозглашение Слова»
+используй один из двух точных форматов:
+• точная цитата Писания + ссылка;
+или
+• краткое исповедание веры + формулировка
+«на основании...» и ссылка.
+Не выдавай богословское применение
+за дословный текст стиха.
+
 11. При необходимости кратко объясняй контекст стиха.
 12. Греческие или еврейские слова используй
 только когда точно уверен в значении
@@ -969,6 +996,93 @@ def random_verse(
     return VERSES[verse_index]
 
 
+def split_telegram_text(
+    text: str,
+) -> list[str]:
+    hard_limit = 4096
+    preferred_limit = 3900
+    min_tail = 450
+    search_from = 1800
+
+    remaining = text.strip()
+    chunks: list[str] = []
+
+    while remaining:
+        if len(remaining) <= hard_limit:
+            chunks.append(remaining)
+            break
+
+        max_split = min(
+            preferred_limit,
+            len(remaining) - min_tail,
+        )
+
+        split_at = -1
+
+        separators = (
+            "\n\n",
+            "\n",
+            ". ",
+            "! ",
+            "? ",
+            "; ",
+            ": ",
+            ", ",
+            " ",
+        )
+
+        for separator in separators:
+            position = remaining.rfind(
+                separator,
+                search_from,
+                max_split,
+            )
+
+            if position == -1:
+                continue
+
+            if separator in (
+                ". ",
+                "! ",
+                "? ",
+                "; ",
+                ": ",
+                ", ",
+            ):
+                split_at = position + 1
+            else:
+                split_at = position
+
+            break
+
+        if split_at < search_from:
+            split_at = max_split
+
+            while (
+                split_at > search_from
+                and not remaining[
+                    split_at - 1
+                ].isspace()
+            ):
+                split_at -= 1
+
+            if split_at <= search_from:
+                split_at = max_split
+
+        chunk = remaining[
+            :split_at
+        ].strip()
+
+        remaining = remaining[
+            split_at:
+        ].lstrip()
+
+        if chunk:
+            chunks.append(chunk)
+
+    return chunks
+
+
 async def send_long_message(
     update: Update,
     text: str,
@@ -978,37 +1092,25 @@ async def send_long_message(
     if not message:
         return
 
-    max_length = 3800
-    remaining = text.strip()
+    chunks = split_telegram_text(
+        text
+    )
 
-    while remaining:
-        if len(remaining) <= max_length:
-            chunk = remaining
-            remaining = ""
-        else:
-            split_at = remaining.rfind(
-                "\n",
-                0,
-                max_length,
-            )
+    for index, chunk in enumerate(
+        chunks
+    ):
+        is_last = (
+            index == len(chunks) - 1
+        )
 
-            if split_at < 1000:
-                split_at = max_length
-
-            chunk = remaining[:split_at].strip()
-            remaining = (
-                remaining[split_at:]
-                .lstrip()
-            )
-
-        if remaining:
-            await message.reply_text(
-                chunk
-            )
-        else:
+        if is_last:
             await message.reply_text(
                 chunk,
                 reply_markup=main_menu(),
+            )
+        else:
+            await message.reply_text(
+                chunk
             )
 
 
