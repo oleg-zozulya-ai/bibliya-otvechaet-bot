@@ -901,11 +901,24 @@ async def generate_ai_answer(
         )
     )
 
+    max_tokens_by_mode = {
+        "ask": 1600,
+        "prayer": 3000,
+        "healing": 3000,
+        "finances": 3000,
+        "blessing": 3000,
+    }
+
+    max_output_tokens = max_tokens_by_mode.get(
+        mode,
+        1600,
+    )
+
     response = await openai_client.responses.create(
         model=MODEL,
         instructions=instructions,
         input=user_text,
-        max_output_tokens=3000,
+        max_output_tokens=max_output_tokens,
     )
 
     answer = clean_ai_text(
@@ -919,7 +932,6 @@ async def generate_ai_answer(
         )
 
     return answer
-
 
 def main_menu() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
