@@ -2,9 +2,12 @@ import logging
 import os
 import random
 import re
+from datetime import datetime, timezone
 
+import httpx
 from openai import AsyncOpenAI
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram.error import NetworkError, RetryAfter, TimedOut
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
@@ -31,6 +34,19 @@ OPENAI_API_KEY = "".join(
     os.environ.get("OPENAI_API_KEY", "").split()
 )
 
+SUPABASE_URL = os.environ.get(
+    "SUPABASE_URL",
+    "",
+).strip().rstrip("/")
+
+SUPABASE_SECRET_KEY = "".join(
+    os.environ.get("SUPABASE_SECRET_KEY", "").split()
+)
+
+SUPABASE_TABLE = "bible_bot_user_state"
+SUPABASE_TIMEOUT_SECONDS = 10.0
+OPENAI_TIMEOUT_SECONDS = 120.0
+
 PORT = int(os.environ.get("PORT", "10000"))
 
 RENDER_EXTERNAL_URL = os.environ.get(
@@ -42,6 +58,8 @@ MODEL = "gpt-5.6-luna"
 
 openai_client = AsyncOpenAI(
     api_key=OPENAI_API_KEY,
+    timeout=OPENAI_TIMEOUT_SECONDS,
+    max_retries=2,
 )
 
 BASE_INSTRUCTIONS = """
@@ -958,17 +976,221 @@ def main_menu() -> InlineKeyboardMarkup:
     )
 
 
-def random_verse(
-    context: ContextTypes.DEFAULT_TYPE,
-) -> dict:
-    queue = context.user_data.get(
-        "verse_queue"
+def supabase_is_configured() -> bool:
+    return bool(
+        SUPABASE_URL
+        and SUPABASE_URL.startswith("https://")
+        and SUPABASE_SECRET_KEY
     )
 
-    last_index = context.user_data.get(
-        "last_verse_index"
+
+def supabase_headers() -> dict[str, str]:
+    return {
+        "apikey": SUPABASE_SECRET_KEY,
+        "Accept": "application/json",
+        "Content-Type": "application/json",
+    }
+
+
+def normalize_verse_state(
+    raw_queue,
+    raw_last_index,
+) -> tuple[list[int], int | None]:
+    queue: list[int] = []
+    seen: set[int] = set()
+
+    if isinstance(raw_queue, list):
+        for value in raw_queue:
+            if (
+                isinstance(value, int)
+                and not isinstance(value, bool)
+                and 0 <= value < len(VERSES)
+                and value not in seen
+            ):
+                queue.append(value)
+                seen.add(value)
+
+    last_index = (
+        raw_last_index
+        if (
+            isinstance(raw_last_index, int)
+            and not isinstance(raw_last_index, bool)
+            and 0 <= raw_last_index < len(VERSES)
+        )
+        else None
     )
 
+    return queue, last_index
+
+
+async def load_verse_state(
+    telegram_user_id: int,
+) -> tuple[list[int], int | None] | None:
+    if not supabase_is_configured():
+        return None
+
+    url = (
+        f"{SUPABASE_URL}/rest/v1/"
+        f"{SUPABASE_TABLE}"
+    )
+
+    params = {
+        "telegram_user_id": (
+            f"eq.{telegram_user_id}"
+        ),
+        "select": (
+            "verse_queue,last_verse_index"
+        ),
+        "limit": "1",
+    }
+
+    try:
+        async with httpx.AsyncClient(
+            timeout=SUPABASE_TIMEOUT_SECONDS,
+        ) as client:
+            response = await client.get(
+                url,
+                headers=supabase_headers(),
+                params=params,
+            )
+            response.raise_for_status()
+
+        rows = response.json()
+
+        if not rows:
+            return [], None
+
+        row = rows[0]
+
+        return normalize_verse_state(
+            row.get("verse_queue"),
+            row.get("last_verse_index"),
+        )
+
+    except (
+        httpx.TimeoutException,
+        httpx.NetworkError,
+        httpx.HTTPStatusError,
+        ValueError,
+    ):
+        logger.exception(
+            "Не удалось прочитать состояние "
+            "стихов из Supabase"
+        )
+        return None
+
+
+async def save_verse_state(
+    telegram_user_id: int,
+    queue: list[int],
+    last_index: int | None,
+) -> bool:
+    if not supabase_is_configured():
+        return False
+
+    url = (
+        f"{SUPABASE_URL}/rest/v1/"
+        f"{SUPABASE_TABLE}"
+    )
+
+    params = {
+        "on_conflict": "telegram_user_id",
+    }
+
+    headers = supabase_headers()
+    headers["Prefer"] = (
+        "resolution=merge-duplicates,"
+        "return=minimal"
+    )
+
+    payload = {
+        "telegram_user_id": telegram_user_id,
+        "verse_queue": queue,
+        "last_verse_index": last_index,
+        "updated_at": datetime.now(
+            timezone.utc
+        ).isoformat(),
+    }
+
+    try:
+        async with httpx.AsyncClient(
+            timeout=SUPABASE_TIMEOUT_SECONDS,
+        ) as client:
+            response = await client.post(
+                url,
+                headers=headers,
+                params=params,
+                json=payload,
+            )
+            response.raise_for_status()
+
+        return True
+
+    except (
+        httpx.TimeoutException,
+        httpx.NetworkError,
+        httpx.HTTPStatusError,
+    ):
+        logger.exception(
+            "Не удалось сохранить состояние "
+            "стихов в Supabase"
+        )
+        return False
+
+
+async def verify_supabase_connection() -> bool:
+    if not supabase_is_configured():
+        logger.warning(
+            "Supabase не настроен полностью. "
+            "Бот продолжит работу "
+            "с памятью процесса."
+        )
+        return False
+
+    url = (
+        f"{SUPABASE_URL}/rest/v1/"
+        f"{SUPABASE_TABLE}"
+    )
+
+    params = {
+        "select": "telegram_user_id",
+        "limit": "1",
+    }
+
+    try:
+        async with httpx.AsyncClient(
+            timeout=SUPABASE_TIMEOUT_SECONDS,
+        ) as client:
+            response = await client.get(
+                url,
+                headers=supabase_headers(),
+                params=params,
+            )
+            response.raise_for_status()
+
+        logger.info(
+            "Supabase подключён: таблица %s доступна",
+            SUPABASE_TABLE,
+        )
+        return True
+
+    except (
+        httpx.TimeoutException,
+        httpx.NetworkError,
+        httpx.HTTPStatusError,
+    ):
+        logger.exception(
+            "Supabase временно недоступен. "
+            "Бот продолжит работу "
+            "с резервной памятью процесса."
+        )
+        return False
+
+
+def choose_next_verse(
+    queue: list[int],
+    last_index: int | None,
+) -> tuple[dict, list[int], int]:
     if not queue:
         queue = list(
             range(len(VERSES))
@@ -990,19 +1212,106 @@ def random_verse(
                     )
                     break
 
+    verse_index = queue.pop()
+
+    return (
+        VERSES[verse_index],
+        queue,
+        verse_index,
+    )
+
+
+async def random_verse(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> dict:
+    user = update.effective_user
+
+    if user is None:
+        queue, last_index = normalize_verse_state(
+            context.user_data.get(
+                "verse_queue",
+                [],
+            ),
+            context.user_data.get(
+                "last_verse_index"
+            ),
+        )
+
+        verse, queue, last_index = (
+            choose_next_verse(
+                queue,
+                last_index,
+            )
+        )
+
         context.user_data[
             "verse_queue"
         ] = queue
+        context.user_data[
+            "last_verse_index"
+        ] = last_index
 
-    verse_index = context.user_data[
-        "verse_queue"
-    ].pop()
+        return verse
+
+    telegram_user_id = user.id
+
+    if not context.user_data.get(
+        "verse_state_loaded",
+        False,
+    ):
+        stored_state = await load_verse_state(
+            telegram_user_id
+        )
+
+        if stored_state is not None:
+            queue, last_index = stored_state
+            context.user_data[
+                "verse_queue"
+            ] = queue
+            context.user_data[
+                "last_verse_index"
+            ] = last_index
+            context.user_data[
+                "verse_state_loaded"
+            ] = True
+
+    queue, last_index = normalize_verse_state(
+        context.user_data.get(
+            "verse_queue",
+            [],
+        ),
+        context.user_data.get(
+            "last_verse_index"
+        ),
+    )
+
+    verse, queue, last_index = (
+        choose_next_verse(
+            queue,
+            last_index,
+        )
+    )
 
     context.user_data[
+        "verse_queue"
+    ] = queue
+    context.user_data[
         "last_verse_index"
-    ] = verse_index
+    ] = last_index
 
-    return VERSES[verse_index]
+    saved = await save_verse_state(
+        telegram_user_id,
+        queue,
+        last_index,
+    )
+
+    if saved:
+        context.user_data[
+            "verse_state_loaded"
+        ] = True
+
+    return verse
 
 
 def split_telegram_text(
@@ -1228,8 +1537,9 @@ async def button_handler(
             None,
         )
 
-        verse = random_verse(
-            context
+        verse = await random_verse(
+            update,
+            context,
         )
 
         text = (
@@ -1367,6 +1677,67 @@ async def text_handler(
             pass
 
 
+
+async def post_init(
+    application: Application,
+) -> None:
+    await verify_supabase_connection()
+
+
+async def error_handler(
+    update: object,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    error = context.error
+
+    if isinstance(error, RetryAfter):
+        logger.warning(
+            "Telegram временно ограничил частоту запросов: %s",
+            error,
+        )
+        return
+
+    if isinstance(
+        error,
+        (TimedOut, NetworkError),
+    ):
+        logger.warning(
+            "Временная сетевая ошибка Telegram: %s",
+            error,
+        )
+        return
+
+    if isinstance(error, BaseException):
+        logger.error(
+            "Необработанная ошибка Telegram update",
+            exc_info=(
+                type(error),
+                error,
+                error.__traceback__,
+            ),
+        )
+    else:
+        logger.error(
+            "Необработанная ошибка Telegram update: %r",
+            error,
+        )
+
+    try:
+        if isinstance(update, Update):
+            message = update.effective_message
+
+            if message is not None:
+                await message.reply_text(
+                    "⚠️ Произошла временная ошибка. "
+                    "Попробуйте действие ещё раз.",
+                    reply_markup=main_menu(),
+                )
+    except Exception:
+        logger.exception(
+            "Не удалось отправить пользователю "
+            "сообщение об ошибке"
+        )
+
 def main() -> None:
     if not TELEGRAM_TOKEN:
         raise RuntimeError(
@@ -1392,6 +1763,7 @@ def main() -> None:
     application = (
         Application.builder()
         .token(TELEGRAM_TOKEN)
+        .post_init(post_init)
         .build()
     )
 
@@ -1414,6 +1786,10 @@ def main() -> None:
             & ~filters.COMMAND,
             text_handler,
         )
+    )
+
+    application.add_error_handler(
+        error_handler
     )
 
     webhook_url = (
