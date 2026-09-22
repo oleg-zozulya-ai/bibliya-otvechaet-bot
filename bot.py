@@ -49,6 +49,12 @@ ANALYTICS_USERS_TABLE = "bible_bot_users"
 ANALYTICS_EVENTS_TABLE = "bible_bot_events"
 SUPABASE_TIMEOUT_SECONDS = 10.0
 OPENAI_TIMEOUT_SECONDS = 120.0
+VOICE_TRANSCRIPTION_MODEL = os.environ.get(
+    "VOICE_TRANSCRIPTION_MODEL",
+    "gpt-4o-transcribe",
+).strip() or "gpt-4o-transcribe"
+MAX_VOICE_DURATION_SECONDS = 600
+MAX_VOICE_FILE_BYTES = 20 * 1024 * 1024
 
 TELEGRAM_ADMIN_ID_RAW = "".join(
     os.environ.get("TELEGRAM_ADMIN_ID", "").split()
@@ -2636,7 +2642,8 @@ async def start(
 
     text = (
         "📖 <b>Библия отвечает</b>\n\n"
-        "Расскажите, что происходит в вашей жизни, "
+        "Расскажите текстом или голосовым сообщением, "
+        "что происходит в вашей жизни, "
         "что вас тревожит или в чём вы нуждаетесь.\n\n"
         "Здесь можно обратиться к Божьему Слову, "
         "получить библейское ободрение "
@@ -2694,7 +2701,7 @@ async def button_handler(
         context.user_data["mode"] = "ask"
         text = (
             "📖 <b>Задайте вопрос</b>\n\n"
-            "Напишите своими словами, "
+            "Напишите или отправьте голосовое сообщение: "
             "что произошло, "
             "что вас тревожит "
             "или какой библейский ответ "
@@ -2705,7 +2712,7 @@ async def button_handler(
         context.user_data["mode"] = "prayer"
         text = (
             "🙏 <b>Молитва по нужде</b>\n\n"
-            "Опишите вашу нужду конкретно: "
+            "Опишите вашу нужду текстом или голосом: "
             "что происходит, "
             "за кого молимся, "
             "чего вы особенно просите у Бога.\n\n"
@@ -2718,7 +2725,7 @@ async def button_handler(
         context.user_data["mode"] = "healing"
         text = (
             "❤️‍🩹 <b>Молитва об исцелении</b>\n\n"
-            "Напишите, за кого молимся "
+            "Напишите или расскажите голосом, за кого молимся "
             "и что известно о состоянии человека.\n\n"
             "Можно указать диагноз, симптомы, "
             "операцию, лечение, страхи семьи "
@@ -2731,7 +2738,7 @@ async def button_handler(
         context.user_data["mode"] = "finances"
         text = (
             "💼 <b>Работа и финансы</b>\n\n"
-            "Опишите вашу ситуацию: "
+            "Опишите ситуацию текстом или голосом: "
             "работа, бизнес, долги, "
             "поиск клиентов, доход, "
             "важное решение или финансовая нужда.\n\n"
@@ -2745,7 +2752,7 @@ async def button_handler(
         context.user_data["mode"] = "blessing"
         text = (
             "✨ <b>Молитва благословения</b>\n\n"
-            "Напишите, кого или что "
+            "Напишите или расскажите голосом, кого или что "
             "вы хотите благословить в молитве: "
             "себя, детей, семью, дом, работу, "
             "служение, дорогу или важное начинание."
@@ -2954,6 +2961,210 @@ async def button_handler(
             reply_markup=reply_markup,
             parse_mode="HTML",
         )
+
+
+async def transcribe_voice_message(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> str:
+    message = update.effective_message
+
+    if not message or not message.voice:
+        return ""
+
+    voice = message.voice
+
+    if (
+        voice.duration
+        and voice.duration > MAX_VOICE_DURATION_SECONDS
+    ):
+        raise ValueError(
+            "Голосовое сообщение слишком длинное. "
+            "Пожалуйста, отправьте его частями "
+            "до 10 минут каждая."
+        )
+
+    if (
+        voice.file_size
+        and voice.file_size > MAX_VOICE_FILE_BYTES
+    ):
+        raise ValueError(
+            "Голосовой файл слишком большой. "
+            "Пожалуйста, отправьте сообщение короче."
+        )
+
+    telegram_file = await context.bot.get_file(
+        voice.file_id
+    )
+    audio = await telegram_file.download_as_bytearray()
+
+    if not audio:
+        raise ValueError(
+            "Не удалось получить голосовое сообщение."
+        )
+
+    transcription = await openai_client.audio.transcriptions.create(
+        model=VOICE_TRANSCRIPTION_MODEL,
+        file=(
+            "telegram_voice.ogg",
+            bytes(audio),
+            "audio/ogg",
+        ),
+        prompt=(
+            "Точно расшифруй голосовое сообщение. "
+            "Сохраняй имена людей, названия мест, "
+            "библейские имена, книги Библии, "
+            "медицинские термины и денежные суммы. "
+            "Не добавляй ничего от себя. "
+            "Сообщение может быть на русском, "
+            "украинском, немецком или другом языке."
+        ),
+    )
+
+    text = getattr(
+        transcription,
+        "text",
+        "",
+    )
+
+    if not isinstance(text, str):
+        return ""
+
+    return text.strip()
+
+
+async def voice_handler(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    message = update.effective_message
+
+    if not message or not message.voice:
+        return
+
+    if context.user_data.get(
+        "awaiting_donation_amount"
+    ):
+        await message.reply_text(
+            "Для суммы пожертвования отправьте, "
+            "пожалуйста, только число текстом, "
+            "например: 500."
+        )
+        return
+
+    wait_message = await message.reply_text(
+        "🎙 Распознаю голосовое сообщение..."
+    )
+
+    user = update.effective_user
+
+    if user:
+        context.application.create_task(
+            analytics_activity(
+                user.id,
+                "voice_message",
+            )
+        )
+
+    try:
+        user_text = await transcribe_voice_message(
+            update,
+            context,
+        )
+
+        if not user_text:
+            raise ValueError(
+                "Не удалось распознать речь. "
+                "Попробуйте записать голосовое ещё раз, "
+                "говоря немного ближе к микрофону."
+            )
+
+        mode = context.user_data.get(
+            "mode",
+            "ask",
+        )
+
+        safe_mode = (
+            mode
+            if mode in {
+                "ask",
+                "prayer",
+                "healing",
+                "finances",
+                "blessing",
+            }
+            else "ask"
+        )
+
+        if user:
+            context.application.create_task(
+                analytics_log_event(
+                    user.id,
+                    "voice_transcribed",
+                )
+            )
+            context.application.create_task(
+                analytics_activity(
+                    user.id,
+                    f"ai_{safe_mode}",
+                )
+            )
+
+        try:
+            await wait_message.edit_text(
+                "📖 Голосовое распознано. "
+                "Подбираю ответ на основании Писания..."
+            )
+        except Exception:
+            pass
+
+        answer = await generate_ai_answer(
+            user_text=user_text,
+            mode=mode,
+        )
+
+        try:
+            await wait_message.delete()
+        except Exception:
+            pass
+
+        await send_long_message(
+            update,
+            answer,
+        )
+
+        context.user_data.pop(
+            "mode",
+            None,
+        )
+
+    except ValueError as exc:
+        logger.info(
+            "Голосовое сообщение отклонено: %s",
+            exc,
+        )
+
+        try:
+            await wait_message.edit_text(
+                f"⚠️ {exc}"
+            )
+        except Exception:
+            pass
+
+    except Exception:
+        logger.exception(
+            "Ошибка обработки голосового сообщения"
+        )
+
+        try:
+            await wait_message.edit_text(
+                "⚠️ Сейчас не удалось обработать "
+                "голосовое сообщение.\n\n"
+                "Попробуйте отправить его ещё раз "
+                "через несколько секунд или напишите текстом."
+            )
+        except Exception:
+            pass
 
 
 async def text_handler(
@@ -3220,6 +3431,13 @@ def main() -> None:
     application.add_handler(
         CallbackQueryHandler(
             button_handler,
+        )
+    )
+
+    application.add_handler(
+        MessageHandler(
+            filters.VOICE,
+            voice_handler,
         )
     )
 
