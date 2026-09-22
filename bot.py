@@ -2,11 +2,12 @@ import logging
 import os
 import random
 import re
+from decimal import Decimal, InvalidOperation
 from datetime import datetime, timezone
 
 import httpx
 from openai import AsyncOpenAI
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram import CopyTextButton, InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.error import NetworkError, RetryAfter, TimedOut
 from telegram.ext import (
     Application,
@@ -53,6 +54,47 @@ RENDER_EXTERNAL_URL = os.environ.get(
     "RENDER_EXTERNAL_URL",
     "",
 ).strip().rstrip("/")
+
+# Публичные реквизиты поддержки.
+# Банковские реквизиты сверены с официальной страницей фонда:
+# https://blessunited.com/rekviziti
+DONATION_OFFICIAL_URL = "https://blessunited.com/rekviziti"
+
+DONATION_RECIPIENT = "БО БФ ОБʼЄДНАНІ У БЛАГОДАТІ УКРАЇНІ"
+DONATION_RECIPIENT_CODE = "45171665"
+
+DONATION_UAH_IBAN = "UA813052990000026005050581845"
+DONATION_UAH_BANK = 'АТ КБ "ПРИВАТБАНК"'
+DONATION_UAH_PURPOSE = "Благодійна допомога"
+
+DONATION_EUR_IBAN = "UA073052990000026005050579006"
+DONATION_USD_IBAN = "UA173052990000026002050584845"
+DONATION_SWIFT = "PBANUA2X"
+DONATION_FOREIGN_BANK = (
+    'JSC CB "PRIVATBANK", '
+    "1D HRUSHEVSKOHO STR., KYIV, 01001, UKRAINE"
+)
+DONATION_RECIPIENT_ADDRESS = (
+    "21050, УКРАЇНА, ОБЛ. ВІННИЦЬКА, М. ВІННИЦЯ, "
+    "ВУЛ. ТЕАТРАЛЬНА, Б. 20, КВ. 410"
+)
+
+# Адрес предоставлен владельцем проекта.
+DONATION_USDT_TRC20 = "TH8a2B77sFFw4CyFppKnE6sNyX4QsMprAp"
+
+DONATION_MINIMUMS = {
+    "UAH": Decimal("50"),
+    "EUR": Decimal("1"),
+    "USD": Decimal("1"),
+    "USDT": Decimal("1"),
+}
+
+DONATION_QUICK_AMOUNTS = {
+    "UAH": [50, 100, 300, 500, 1000],
+    "EUR": [5, 10, 25, 50, 100],
+    "USD": [5, 10, 25, 50, 100],
+    "USDT": [5, 10, 25, 50, 100],
+}
 
 MODEL = "gpt-5.6-luna"
 
@@ -956,6 +998,403 @@ async def generate_ai_answer(
     return answer
 
 
+
+def donation_main_menu() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton(
+                    "🇺🇦 UAH / гривна",
+                    callback_data="donate_uah",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    "🇪🇺 EUR / банковский перевод",
+                    callback_data="donate_eur",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    "💵 USD / банковский перевод",
+                    callback_data="donate_usd",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    "₮ USDT / TRC20",
+                    callback_data="donate_usdt",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    "🏠 Главное меню",
+                    callback_data="menu",
+                )
+            ],
+        ]
+    )
+
+
+def currency_label(currency: str) -> str:
+    labels = {
+        "UAH": "🇺🇦 Гривна / UAH",
+        "EUR": "🇪🇺 Евро / EUR",
+        "USD": "💵 Доллары / USD",
+        "USDT": "₮ USDT / TRC20",
+    }
+    return labels.get(currency, currency)
+
+
+def format_donation_amount(
+    amount: Decimal,
+    currency: str,
+) -> str:
+    if amount == amount.to_integral_value():
+        number = f"{int(amount):,}".replace(",", " ")
+    else:
+        number = (
+            f"{amount.quantize(Decimal('0.01')):,.2f}"
+            .replace(",", " ")
+        )
+
+    suffixes = {
+        "UAH": "₴",
+        "EUR": "€",
+        "USD": "$",
+        "USDT": "USDT",
+    }
+    suffix = suffixes.get(currency, currency)
+
+    if currency in {"EUR", "USD"}:
+        return f"{suffix}{number}"
+
+    return f"{number} {suffix}"
+
+
+def donation_amount_menu(
+    currency: str,
+) -> InlineKeyboardMarkup:
+    rows = []
+    amounts = DONATION_QUICK_AMOUNTS[currency]
+
+    current_row = []
+
+    for value in amounts:
+        amount = Decimal(str(value))
+        current_row.append(
+            InlineKeyboardButton(
+                format_donation_amount(
+                    amount,
+                    currency,
+                ),
+                callback_data=(
+                    f"don_amt_{currency.lower()}_{value}"
+                ),
+            )
+        )
+
+        if len(current_row) == 2:
+            rows.append(current_row)
+            current_row = []
+
+    if current_row:
+        rows.append(current_row)
+
+    rows.extend(
+        [
+            [
+                InlineKeyboardButton(
+                    "✏️ Другая сумма",
+                    callback_data=(
+                        f"don_custom_{currency.lower()}"
+                    ),
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    "📋 Реквизиты без суммы",
+                    callback_data=(
+                        f"don_details_{currency.lower()}"
+                    ),
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    "⬅️ Способы поддержки",
+                    callback_data="donate",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    "🏠 Главное меню",
+                    callback_data="menu",
+                )
+            ],
+        ]
+    )
+
+    return InlineKeyboardMarkup(rows)
+
+
+def donation_details_menu(
+    currency: str,
+    amount: Decimal | None = None,
+) -> InlineKeyboardMarkup:
+    rows = []
+
+    if amount is not None:
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    "📋 Скопировать сумму",
+                    copy_text=CopyTextButton(
+                        text=str(
+                            amount.normalize()
+                        ),
+                    ),
+                )
+            ]
+        )
+
+    if currency == "UAH":
+        rows.extend(
+            [
+                [
+                    InlineKeyboardButton(
+                        "📋 Скопировать IBAN",
+                        copy_text=CopyTextButton(
+                            text=DONATION_UAH_IBAN,
+                        ),
+                    )
+                ],
+                [
+                    InlineKeyboardButton(
+                        "📋 Скопировать код получателя",
+                        copy_text=CopyTextButton(
+                            text=DONATION_RECIPIENT_CODE,
+                        ),
+                    )
+                ],
+                [
+                    InlineKeyboardButton(
+                        "📋 Скопировать назначение",
+                        copy_text=CopyTextButton(
+                            text=DONATION_UAH_PURPOSE,
+                        ),
+                    )
+                ],
+            ]
+        )
+
+    elif currency in {"EUR", "USD"}:
+        iban = (
+            DONATION_EUR_IBAN
+            if currency == "EUR"
+            else DONATION_USD_IBAN
+        )
+
+        rows.extend(
+            [
+                [
+                    InlineKeyboardButton(
+                        "📋 Скопировать IBAN",
+                        copy_text=CopyTextButton(
+                            text=iban,
+                        ),
+                    )
+                ],
+                [
+                    InlineKeyboardButton(
+                        "📋 Скопировать SWIFT",
+                        copy_text=CopyTextButton(
+                            text=DONATION_SWIFT,
+                        ),
+                    )
+                ],
+            ]
+        )
+
+    elif currency == "USDT":
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    "📋 Скопировать USDT-адрес",
+                    copy_text=CopyTextButton(
+                        text=DONATION_USDT_TRC20,
+                    ),
+                )
+            ]
+        )
+
+    if currency in {"UAH", "EUR", "USD"}:
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    "🌐 Официальные реквизиты фонда",
+                    url=DONATION_OFFICIAL_URL,
+                )
+            ]
+        )
+
+    rows.extend(
+        [
+            [
+                InlineKeyboardButton(
+                    "⬅️ Изменить сумму",
+                    callback_data=(
+                        f"donate_{currency.lower()}"
+                    ),
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    "🤝 Другой способ",
+                    callback_data="donate",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    "🏠 Главное меню",
+                    callback_data="menu",
+                )
+            ],
+        ]
+    )
+
+    return InlineKeyboardMarkup(rows)
+
+
+def donation_details_text(
+    currency: str,
+    amount: Decimal | None = None,
+) -> str:
+    amount_block = ""
+
+    if amount is not None:
+        amount_block = (
+            f"\n<b>Вы выбрали:</b> "
+            f"{format_donation_amount(amount, currency)}\n"
+        )
+
+    if currency == "UAH":
+        return (
+            "🇺🇦 <b>Поддержка в гривне</b>\n"
+            f"{amount_block}\n"
+            "Перевод выполняется в вашем банковском приложении.\n\n"
+            f"<b>Получатель:</b> {DONATION_RECIPIENT}\n"
+            f"<b>Код:</b> <code>{DONATION_RECIPIENT_CODE}</code>\n"
+            f"<b>IBAN:</b> <code>{DONATION_UAH_IBAN}</code>\n"
+            f"<b>Банк:</b> {DONATION_UAH_BANK}\n"
+            f"<b>Назначение:</b> {DONATION_UAH_PURPOSE}\n\n"
+            "Перед подтверждением перевода проверьте "
+            "получателя и IBAN."
+        )
+
+    if currency == "EUR":
+        return (
+            "🇪🇺 <b>Поддержка в евро</b>\n"
+            f"{amount_block}\n"
+            "Это банковский валютный перевод на официальный "
+            "EUR-счёт фонда.\n\n"
+            f"<b>Получатель:</b> {DONATION_RECIPIENT}\n"
+            f"<b>IBAN:</b> <code>{DONATION_EUR_IBAN}</code>\n"
+            f"<b>SWIFT:</b> <code>{DONATION_SWIFT}</code>\n"
+            f"<b>Банк:</b> {DONATION_FOREIGN_BANK}\n"
+            f"<b>Адрес получателя:</b> {DONATION_RECIPIENT_ADDRESS}\n\n"
+            "Если ваш банк запросит банк-корреспондент, "
+            "используйте кнопку «Официальные реквизиты фонда»."
+        )
+
+    if currency == "USD":
+        return (
+            "💵 <b>Поддержка в долларах</b>\n"
+            f"{amount_block}\n"
+            "Это банковский валютный перевод на официальный "
+            "USD-счёт фонда.\n\n"
+            f"<b>Получатель:</b> {DONATION_RECIPIENT}\n"
+            f"<b>IBAN:</b> <code>{DONATION_USD_IBAN}</code>\n"
+            f"<b>SWIFT:</b> <code>{DONATION_SWIFT}</code>\n"
+            f"<b>Банк:</b> {DONATION_FOREIGN_BANK}\n"
+            f"<b>Адрес получателя:</b> {DONATION_RECIPIENT_ADDRESS}\n\n"
+            "Если ваш банк запросит банк-корреспондент, "
+            "используйте кнопку «Официальные реквизиты фонда»."
+        )
+
+    if currency == "USDT":
+        return (
+            "₮ <b>Поддержка USDT</b>\n"
+            f"{amount_block}\n"
+            "<b>Сеть:</b> TRON / TRC20\n"
+            f"<b>Адрес:</b>\n<code>{DONATION_USDT_TRC20}</code>\n\n"
+            "⚠️ Отправляйте только USDT по сети TRON / TRC20. "
+            "Криптовалютные переводы обычно необратимы, "
+            "поэтому перед отправкой ещё раз сверьте адрес и сеть. "
+            "Для крупной суммы разумно сначала сделать небольшой "
+            "тестовый перевод."
+        )
+
+    return "Выберите способ поддержки."
+
+
+def parse_donation_amount(
+    text: str,
+    currency: str,
+) -> tuple[Decimal | None, str | None]:
+    cleaned = text.strip().upper()
+
+    for token in (
+        "UAH",
+        "EUR",
+        "USD",
+        "USDT",
+        "₴",
+        "€",
+        "$",
+    ):
+        cleaned = cleaned.replace(
+            token,
+            "",
+        )
+
+    cleaned = (
+        cleaned
+        .replace(" ", "")
+        .replace(",", ".")
+    )
+
+    if not re.fullmatch(
+        r"\d+(?:\.\d{1,2})?",
+        cleaned,
+    ):
+        return (
+            None,
+            "Введите только сумму, например: 500",
+        )
+
+    try:
+        amount = Decimal(cleaned)
+    except InvalidOperation:
+        return (
+            None,
+            "Не удалось распознать сумму.",
+        )
+
+    minimum = DONATION_MINIMUMS[currency]
+
+    if amount < minimum:
+        return (
+            None,
+            (
+                "Минимальная сумма для этого раздела — "
+                f"{format_donation_amount(minimum, currency)}."
+            ),
+        )
+
+    return amount, None
+
+
+
 def main_menu() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         [
@@ -1475,6 +1914,10 @@ async def start(
         "mode",
         None,
     )
+    context.user_data.pop(
+        "awaiting_donation_amount",
+        None,
+    )
 
     text = (
         "📖 <b>Библия отвечает</b>\n\n"
@@ -1501,9 +1944,24 @@ async def button_handler(
     context: ContextTypes.DEFAULT_TYPE,
 ) -> None:
     query = update.callback_query
+
+    if not query:
+        return
+
     await query.answer()
 
     action = query.data
+
+    if not action:
+        return
+
+    if not action.startswith("don_custom_"):
+        context.user_data.pop(
+            "awaiting_donation_amount",
+            None,
+        )
+
+    reply_markup = main_menu()
 
     if action == "ask":
         context.user_data["mode"] = "ask"
@@ -1592,22 +2050,135 @@ async def button_handler(
         )
 
         text = (
-            "🤝 <b>Поддержать служение</b>\n\n"
-            "Если этот проект помогает вам "
-            "чаще обращаться к Божьему Слову, "
-            "молиться и укрепляться во Христе, "
-            "вы можете добровольно участвовать "
-            "в его дальнейшем развитии.\n\n"
-            "Поддержка может использоваться "
-            "на работу сервера и AI, "
-            "развитие новых функций, "
-            "переводы, библейские материалы "
-            "и евангелизационное направление проекта.\n\n"
-            "Пожертвование полностью добровольно. "
-            "Доступ к молитве и библейским ответам "
-            "не зависит от пожертвования.\n\n"
-            "Реквизиты для поддержки "
-            "будут добавлены владельцем проекта."
+            "🤝 <b>Поддержать служение «Библия отвечает»</b>\n\n"
+            "Если вы свободно желаете участвовать "
+            "в распространении Божьего Слова "
+            "и развитии этого служения, "
+            "выберите удобный способ поддержки.\n\n"
+            "Поддержка полностью добровольна. "
+            "Молитва, библейский ответ и доступ к боту "
+            "не зависят от пожертвования.\n\n"
+            "Выберите валюту или криптовалюту:"
+        )
+        reply_markup = donation_main_menu()
+
+    elif action in {
+        "donate_uah",
+        "donate_eur",
+        "donate_usd",
+        "donate_usdt",
+    }:
+        context.user_data.pop(
+            "mode",
+            None,
+        )
+
+        currency = action.replace(
+            "donate_",
+            "",
+        ).upper()
+
+        minimum = DONATION_MINIMUMS[currency]
+
+        text = (
+            f"{currency_label(currency)}\n\n"
+            "Выберите удобную сумму "
+            "или нажмите «Другая сумма».\n\n"
+            f"Минимум: "
+            f"{format_donation_amount(minimum, currency)}.\n"
+            "Верхний предел бот не устанавливает; "
+            "фактические банковские лимиты могут зависеть "
+            "от вашего банка или платёжного сервиса."
+        )
+        reply_markup = donation_amount_menu(
+            currency
+        )
+
+    elif action.startswith("don_amt_"):
+        context.user_data.pop(
+            "mode",
+            None,
+        )
+
+        parts = action.split("_")
+
+        if len(parts) != 4:
+            text = "Не удалось определить сумму."
+        else:
+            currency = parts[2].upper()
+            amount = Decimal(parts[3])
+
+            text = donation_details_text(
+                currency,
+                amount,
+            )
+            reply_markup = donation_details_menu(
+                currency,
+                amount,
+            )
+
+    elif action.startswith("don_details_"):
+        context.user_data.pop(
+            "mode",
+            None,
+        )
+
+        currency = action.replace(
+            "don_details_",
+            "",
+        ).upper()
+
+        text = donation_details_text(
+            currency
+        )
+        reply_markup = donation_details_menu(
+            currency
+        )
+
+    elif action.startswith("don_custom_"):
+        context.user_data.pop(
+            "mode",
+            None,
+        )
+
+        currency = action.replace(
+            "don_custom_",
+            "",
+        ).upper()
+
+        context.user_data[
+            "awaiting_donation_amount"
+        ] = currency
+
+        minimum = DONATION_MINIMUMS[currency]
+
+        text = (
+            f"✏️ <b>Другая сумма — "
+            f"{currency_label(currency)}</b>\n\n"
+            "Напишите сумму одним сообщением.\n\n"
+            "Например: <code>750</code> "
+            "или <code>2500</code>.\n\n"
+            f"Минимум: "
+            f"{format_donation_amount(minimum, currency)}."
+        )
+
+        reply_markup = InlineKeyboardMarkup(
+            [
+                [
+                    InlineKeyboardButton(
+                        "⬅️ Назад",
+                        callback_data=(
+                            f"donate_{currency.lower()}"
+                        ),
+                    )
+                ],
+                [
+                    InlineKeyboardButton(
+                        "🏠 Главное меню",
+                        callback_data="menu",
+                    )
+                ],
+            ]
         )
 
     elif action == "about":
@@ -1632,6 +2203,17 @@ async def button_handler(
             "не к технологии, а ко Христу."
         )
 
+    elif action == "menu":
+        context.user_data.pop(
+            "mode",
+            None,
+        )
+
+        text = (
+            "📖 <b>Библия отвечает</b>\n\n"
+            "Выберите нужный раздел:"
+        )
+
     else:
         context.user_data.pop(
             "mode",
@@ -1639,11 +2221,12 @@ async def button_handler(
         )
         text = "Выберите нужный раздел:"
 
-    await query.message.reply_text(
-        text,
-        reply_markup=main_menu(),
-        parse_mode="HTML",
-    )
+    if query.message:
+        await query.message.reply_text(
+            text,
+            reply_markup=reply_markup,
+            parse_mode="HTML",
+        )
 
 
 async def text_handler(
@@ -1661,6 +2244,47 @@ async def text_handler(
     )
 
     if not user_text:
+        return
+
+    donation_currency = context.user_data.get(
+        "awaiting_donation_amount"
+    )
+
+    if donation_currency:
+        amount, error = parse_donation_amount(
+            user_text,
+            donation_currency,
+        )
+
+        if error:
+            await update.message.reply_text(
+                "⚠️ " + error,
+                reply_markup=donation_amount_menu(
+                    donation_currency
+                ),
+            )
+            return
+
+        context.user_data.pop(
+            "awaiting_donation_amount",
+            None,
+        )
+        context.user_data.pop(
+            "mode",
+            None,
+        )
+
+        await update.message.reply_text(
+            donation_details_text(
+                donation_currency,
+                amount,
+            ),
+            reply_markup=donation_details_menu(
+                donation_currency,
+                amount,
+            ),
+            parse_mode="HTML",
+        )
         return
 
     mode = context.user_data.get(
