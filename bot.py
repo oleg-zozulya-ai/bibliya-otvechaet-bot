@@ -1,14 +1,16 @@
+import asyncio
 import logging
 import os
 import random
 import re
 from decimal import Decimal, InvalidOperation
 from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 
 import httpx
 from openai import AsyncOpenAI
 from telegram import CopyTextButton, InlineKeyboardButton, InlineKeyboardMarkup, Update
-from telegram.error import NetworkError, RetryAfter, TimedOut
+from telegram.error import BadRequest, Forbidden, NetworkError, RetryAfter, TimedOut
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
@@ -55,6 +57,18 @@ VOICE_TRANSCRIPTION_MODEL = os.environ.get(
 ).strip() or "gpt-4o-transcribe"
 MAX_VOICE_DURATION_SECONDS = 600
 MAX_VOICE_FILE_BYTES = 20 * 1024 * 1024
+
+# Ежедневное «Слово на сегодня».
+# Отправка идёт в 07:10 по времени Германии.
+DAILY_TIMEZONE = ZoneInfo("Europe/Berlin")
+DAILY_SEND_HOUR = 7
+DAILY_SEND_MINUTE = 10
+DAILY_TOPIC_HISTORY_LIMIT = 10000
+DAILY_TOPIC_PROMPT_LIMIT = 365
+DAILY_SYSTEM_USER_ID = 0
+DAILY_SCHEDULER_INTERVAL_SECONDS = 60
+DAILY_WORD_CACHE: dict[str, tuple[str, str]] = {}
+DAILY_GENERATION_LOCK = asyncio.Lock()
 
 TELEGRAM_ADMIN_ID_RAW = "".join(
     os.environ.get("TELEGRAM_ADMIN_ID", "").split()
@@ -1454,6 +1468,12 @@ def main_menu() -> InlineKeyboardMarkup:
             ],
             [
                 InlineKeyboardButton(
+                    "🌅 Слово на каждый день",
+                    callback_data="daily",
+                )
+            ],
+            [
+                InlineKeyboardButton(
                     "📖 Стих из Библии",
                     callback_data="verse",
                 )
@@ -1550,6 +1570,10 @@ def analytics_event_for_action(
         "finances": "menu_finances",
         "blessing": "menu_blessing",
         "verse": "menu_verse",
+        "daily": "menu_daily",
+        "daily_subscribe": "daily_subscribe_click",
+        "daily_unsubscribe": "daily_unsubscribe_click",
+        "daily_today": "daily_today_click",
         "about": "menu_about",
         "menu": "menu_home",
     }
@@ -1799,6 +1823,908 @@ async def analytics_activity(
         event_name,
     )
 
+
+
+
+async def analytics_has_event(
+    telegram_user_id: int,
+    event_name: str,
+) -> bool:
+    """Проверяет наличие точного события без изменения схемы БД."""
+    if not supabase_is_configured():
+        return False
+
+    safe_event = re.sub(
+        r"[^a-z0-9_-]",
+        "_",
+        event_name.lower(),
+    )[:80]
+
+    url = (
+        f"{SUPABASE_URL}/rest/v1/"
+        f"{ANALYTICS_EVENTS_TABLE}"
+    )
+    params = {
+        "telegram_user_id": f"eq.{telegram_user_id}",
+        "event_name": f"eq.{safe_event}",
+        "select": "id",
+        "limit": "1",
+    }
+
+    try:
+        async with httpx.AsyncClient(
+            timeout=SUPABASE_TIMEOUT_SECONDS,
+        ) as client:
+            response = await client.get(
+                url,
+                headers=supabase_headers(),
+                params=params,
+            )
+            response.raise_for_status()
+        rows = response.json()
+        return bool(rows)
+    except (
+        httpx.TimeoutException,
+        httpx.NetworkError,
+        httpx.HTTPStatusError,
+        ValueError,
+    ):
+        logger.exception(
+            "Не удалось проверить событие аналитики"
+        )
+        return False
+
+
+async def analytics_fetch_events(
+    filters_map: dict[str, str],
+    *,
+    select: str = "telegram_user_id,event_name,created_at",
+    order: str = "created_at.asc",
+    max_rows: int = 10000,
+) -> list[dict]:
+    """Постранично читает события из Supabase."""
+    if not supabase_is_configured():
+        return []
+
+    url = (
+        f"{SUPABASE_URL}/rest/v1/"
+        f"{ANALYTICS_EVENTS_TABLE}"
+    )
+    result: list[dict] = []
+    page_size = 1000
+    offset = 0
+
+    try:
+        async with httpx.AsyncClient(
+            timeout=SUPABASE_TIMEOUT_SECONDS,
+        ) as client:
+            while len(result) < max_rows:
+                params = {
+                    "select": select,
+                    "order": order,
+                    "limit": str(
+                        min(page_size, max_rows - len(result))
+                    ),
+                    "offset": str(offset),
+                    **filters_map,
+                }
+                response = await client.get(
+                    url,
+                    headers=supabase_headers(),
+                    params=params,
+                )
+                response.raise_for_status()
+                rows = response.json()
+
+                if not isinstance(rows, list):
+                    break
+
+                result.extend(rows)
+                if len(rows) < page_size:
+                    break
+                offset += len(rows)
+
+    except (
+        httpx.TimeoutException,
+        httpx.NetworkError,
+        httpx.HTTPStatusError,
+        ValueError,
+    ):
+        logger.exception(
+            "Не удалось получить список событий аналитики"
+        )
+
+    return result
+
+
+def daily_date_key(
+    value: datetime | None = None,
+) -> str:
+    now = value or datetime.now(DAILY_TIMEZONE)
+    return now.astimezone(DAILY_TIMEZONE).strftime("%Y_%m_%d")
+
+
+def daily_sent_event(date_key: str) -> str:
+    return f"daily_sent_{date_key}"
+
+
+def daily_topic_prefix(date_key: str) -> str:
+    return f"daily_topic_{date_key}_"
+
+
+async def daily_get_active_subscriber_ids() -> set[int]:
+    rows = await analytics_fetch_events(
+        {
+            "event_name": (
+                "in.(daily_subscribe,daily_unsubscribe)"
+            )
+        },
+        max_rows=10000,
+    )
+
+    status: dict[int, bool] = {}
+    for row in rows:
+        user_id = row.get("telegram_user_id")
+        event_name = row.get("event_name")
+        if not isinstance(user_id, int):
+            continue
+        if event_name == "daily_subscribe":
+            status[user_id] = True
+        elif event_name == "daily_unsubscribe":
+            status[user_id] = False
+
+    return {
+        user_id
+        for user_id, subscribed in status.items()
+        if subscribed and user_id > 0
+    }
+
+
+async def daily_is_subscribed(
+    telegram_user_id: int,
+) -> bool:
+    rows = await analytics_fetch_events(
+        {
+            "telegram_user_id": f"eq.{telegram_user_id}",
+            "event_name": (
+                "in.(daily_subscribe,daily_unsubscribe)"
+            ),
+        },
+        order="created_at.desc",
+        max_rows=1,
+    )
+    if not rows:
+        return False
+    return rows[0].get("event_name") == "daily_subscribe"
+
+
+async def daily_get_sent_user_ids(
+    date_key: str,
+) -> set[int]:
+    rows = await analytics_fetch_events(
+        {
+            "event_name": f"eq.{daily_sent_event(date_key)}",
+        },
+        max_rows=10000,
+    )
+    result: set[int] = set()
+    for row in rows:
+        user_id = row.get("telegram_user_id")
+        if isinstance(user_id, int) and user_id > 0:
+            result.add(user_id)
+    return result
+
+
+async def daily_get_recent_topic_keys() -> list[str]:
+    rows = await analytics_fetch_events(
+        {
+            "telegram_user_id": f"eq.{DAILY_SYSTEM_USER_ID}",
+            "event_name": "like.daily_topic_*",
+        },
+        order="created_at.desc",
+        max_rows=DAILY_TOPIC_HISTORY_LIMIT,
+    )
+
+    keys: list[str] = []
+    for row in rows:
+        event_name = row.get("event_name")
+        if not isinstance(event_name, str):
+            continue
+        match = re.match(
+            r"daily_topic_\d{4}_\d{2}_\d{2}_(.+)$",
+            event_name,
+        )
+        if match:
+            key = match.group(1).strip("_")
+            if key and key not in keys:
+                keys.append(key)
+    return keys
+
+
+async def daily_get_today_topic_key(
+    date_key: str,
+) -> str | None:
+    rows = await analytics_fetch_events(
+        {
+            "telegram_user_id": f"eq.{DAILY_SYSTEM_USER_ID}",
+            "event_name": f"like.{daily_topic_prefix(date_key)}*",
+        },
+        order="created_at.asc",
+        max_rows=1,
+    )
+    if not rows:
+        return None
+
+    event_name = rows[0].get("event_name")
+    if not isinstance(event_name, str):
+        return None
+
+    prefix = daily_topic_prefix(date_key)
+    if not event_name.startswith(prefix):
+        return None
+
+    key = event_name[len(prefix):].strip("_")
+    return key or None
+
+
+def parse_daily_generation(
+    raw_text: str,
+) -> tuple[str | None, str]:
+    raw_text = (raw_text or "").strip()
+    match = re.search(
+        r"(?im)^REFERENCE_KEY:\s*([a-z0-9_]{3,70})\s*$",
+        raw_text,
+    )
+    key = match.group(1).lower() if match else None
+
+    body_match = re.search(
+        r"(?is)^.*?^BODY:\s*\n?(.*)$",
+        raw_text,
+    )
+    body = body_match.group(1).strip() if body_match else raw_text
+    return key, clean_ai_text(body)
+
+
+async def generate_daily_word(
+    *,
+    forced_reference_key: str | None = None,
+    recent_topic_keys: list[str] | None = None,
+) -> tuple[str, str]:
+    recent_topic_keys = recent_topic_keys or []
+
+    recent_for_prompt = ", ".join(
+        recent_topic_keys[:DAILY_TOPIC_PROMPT_LIMIT]
+    ) or "пока нет"
+
+    if forced_reference_key:
+        topic_instruction = (
+            "Сегодняшний отрывок уже выбран. "
+            "Используй именно этот ключ библейского места: "
+            f"{forced_reference_key}. "
+            "Не меняй его на другой."
+        )
+    else:
+        topic_instruction = (
+            "Выбери сильный библейский отрывок или эпизод, "
+            "которого нет в списке недавних тем. "
+            "Не повторяй ни тот же стих, ни тот же основной сюжет."
+        )
+
+    generation_instructions = """
+Ты создаёшь ежедневное христианское размышление для Telegram-проекта
+«Библия отвечает».
+
+Цель: чтобы человеку хотелось читать его каждый день, глубже понимать
+Писание, приближаться ко Христу, молиться и применять Слово в жизни.
+
+Требования к качеству:
+• строго опирайся на Библию;
+• не выдумывай книги, главы, стихи, детали библейских историй;
+• не приписывай Богу обещаний, которых текст не даёт;
+• не превращай веру в магическую формулу или гарантию желаемого исхода;
+• если приводишь дословную цитату, она должна быть точной; если есть
+  сомнение в дословности, передай смысл без кавычек и укажи ссылку;
+• не выдумывай современные «свидетельства». Раздел свидетельства должен
+  опираться на реальное событие из Писания;
+• не копируй стиль конкретного современного автора или проповедника;
+• пиши живо, глубоко, пастырски, без канцелярита и пустых клише;
+• центр надежды — Иисус Христос, Божья верность и послушание Слову;
+• русский язык, обычный текст без Markdown-символов **, ### и обратных кавычек.
+
+Длина всего BODY: примерно 380–520 слов и не больше 600 слов.
+Не повторяй одну мысль разными словами.
+
+Структура BODY:
+📖 Слово на сегодня
+
+Короткая точная цитата или аккуратный пересказ выбранного места Писания
+с указанием ссылки.
+
+🔥 Сильный уникальный заголовок
+
+Основное размышление: объясни контекст, духовный принцип и связь с
+реальной жизнью человека. Пиши так, чтобы текст был понятен и новичку,
+и человеку, давно читающему Библию.
+
+🌿 Свидетельство Божьей славы
+Коротко покажи реальный библейский эпизод, где видна Божья верность,
+сила, милость, освобождение, восстановление или водительство. Не выдавай
+человеческое предположение за факт Писания.
+
+✅ На сегодня
+Дай ровно 3 коротких практических шага, пронумерованных (1), (2), (3).
+
+🙏 Молитва
+2–4 предложения, Христоцентрично и по теме дня.
+
+Верни ответ строго в формате:
+REFERENCE_KEY: english_book_chapter_verse
+BODY:
+<готовое размышление>
+
+REFERENCE_KEY должен быть только латиницей, цифрами и подчёркиваниями,
+например: joshua_6_1 или romans_8_31_39.
+"""
+
+    base_input = (
+        f"{topic_instruction}\n\n"
+        "Недавние темы, которые нельзя повторять:\n"
+        f"{recent_for_prompt}\n\n"
+        "Создай сегодняшнее Слово."
+    )
+
+    last_key: str | None = None
+    last_body = ""
+
+    for _ in range(3):
+        response = await openai_client.responses.create(
+            model=MODEL,
+            instructions=generation_instructions,
+            input=base_input,
+            max_output_tokens=2400,
+        )
+        key, body = parse_daily_generation(
+            response.output_text or ""
+        )
+        last_key = key
+        last_body = body
+
+        if forced_reference_key:
+            key = forced_reference_key
+
+        if (
+            key
+            and body
+            and (
+                forced_reference_key
+                or key not in set(recent_topic_keys)
+            )
+        ):
+            last_key = key
+            break
+
+        base_input += (
+            "\n\nПредыдущая попытка повторила тему или нарушила формат. "
+            "Выбери другое библейское место и верни точный формат."
+        )
+
+    if not last_key or not last_body:
+        raise RuntimeError(
+            "Не удалось сформировать ежедневное Слово"
+        )
+
+    audit_instructions = """
+Ты — редактор библейского ежедневного размышления.
+Проверь текст перед публикацией.
+
+Исправь только то, что необходимо для точности и качества:
+• ссылки и факты Писания должны быть корректны;
+• сомнительную дословную цитату замени точным кратким пересказом без
+  кавычек, сохранив ссылку;
+• не допускай выдуманных современных свидетельств;
+• свидетельство должно быть из Писания;
+• не обещай человеку гарантированного материального успеха, исцеления или
+  определённого исхода там, где Писание этого не обещает;
+• сохрани сильный, живой, пастырский тон и призыв к вере и послушанию;
+• сохрани структуру, 3 практических шага и короткую молитву;
+• итог 380–520 слов, максимум 600;
+• обычный текст без Markdown-разметки.
+
+Верни только готовый текст для Telegram, без комментариев редактора.
+"""
+
+    audit_response = await openai_client.responses.create(
+        model=MODEL,
+        instructions=audit_instructions,
+        input=(
+            f"Выбранный ключ отрывка: {last_key}\n\n"
+            f"Текст:\n{last_body}"
+        ),
+        max_output_tokens=2400,
+    )
+
+    audited = clean_ai_text(
+        audit_response.output_text or ""
+    )
+    if audited:
+        last_body = audited
+
+    return last_key, last_body
+
+
+async def get_or_generate_daily_word(
+    date_key: str,
+) -> tuple[str, str]:
+    cached = DAILY_WORD_CACHE.get(date_key)
+    if cached:
+        return cached
+
+    async with DAILY_GENERATION_LOCK:
+        cached = DAILY_WORD_CACHE.get(date_key)
+        if cached:
+            return cached
+
+        today_key = await daily_get_today_topic_key(date_key)
+        recent = await daily_get_recent_topic_keys()
+
+        if today_key:
+            result = await generate_daily_word(
+                forced_reference_key=today_key,
+                recent_topic_keys=recent,
+            )
+            DAILY_WORD_CACHE[date_key] = result
+            return result
+
+        key, body = await generate_daily_word(
+            recent_topic_keys=recent,
+        )
+
+        await analytics_log_event(
+            DAILY_SYSTEM_USER_ID,
+            f"{daily_topic_prefix(date_key)}{key}",
+        )
+        result = (key, body)
+        DAILY_WORD_CACHE[date_key] = result
+
+        # Держим в памяти только несколько последних дней.
+        if len(DAILY_WORD_CACHE) > 3:
+            for old_key in sorted(DAILY_WORD_CACHE)[:-3]:
+                DAILY_WORD_CACHE.pop(old_key, None)
+
+        return result
+
+
+def daily_post_menu(
+    subscribed: bool,
+) -> InlineKeyboardMarkup:
+    rows = [
+        [
+            InlineKeyboardButton(
+                "📖 Задать вопрос Библии",
+                callback_data="ask",
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                "🙏 Нужна молитва",
+                callback_data="prayer",
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                "🤝 Поддержать проект",
+                callback_data="donate",
+            )
+        ],
+    ]
+
+    if subscribed:
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    "🔕 Отключить ежедневное Слово",
+                    callback_data="daily_unsubscribe",
+                )
+            ]
+        )
+    else:
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    "🔔 Получать Слово каждый день",
+                    callback_data="daily_subscribe",
+                )
+            ]
+        )
+
+    return InlineKeyboardMarkup(rows)
+
+
+def daily_settings_menu(
+    subscribed: bool,
+) -> InlineKeyboardMarkup:
+    rows = [
+        [
+            InlineKeyboardButton(
+                "📖 Слово на сегодня",
+                callback_data="daily_today",
+            )
+        ],
+    ]
+    if subscribed:
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    "🔕 Отключить ежедневное Слово",
+                    callback_data="daily_unsubscribe",
+                )
+            ]
+        )
+    else:
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    "🔔 Получать каждый день в 07:10",
+                    callback_data="daily_subscribe",
+                )
+            ]
+        )
+    rows.append(
+        [
+            InlineKeyboardButton(
+                "🏠 Главное меню",
+                callback_data="menu",
+            )
+        ]
+    )
+    return InlineKeyboardMarkup(rows)
+
+
+async def send_daily_word_to_chat(
+    bot,
+    chat_id: int,
+    text: str,
+    *,
+    subscribed: bool,
+) -> None:
+    chunks = split_telegram_text(text)
+    for index, chunk in enumerate(chunks):
+        kwargs = {}
+        if index == len(chunks) - 1:
+            kwargs["reply_markup"] = daily_post_menu(subscribed)
+        await bot.send_message(
+            chat_id=chat_id,
+            text=chunk,
+            **kwargs,
+        )
+
+
+async def ensure_support_pin_for_chat(
+    bot,
+    telegram_user_id: int,
+) -> None:
+    if await analytics_has_event(
+        telegram_user_id,
+        "support_message_created",
+    ):
+        return
+
+    text = (
+        "🤝 Поддержать проект «Библия отвечает»\n\n"
+        "Если это служение помогает вам обращаться к Божьему Слову, "
+        "молиться и укрепляться в вере, вы можете добровольно поддержать "
+        "его развитие.\n\n"
+        "Пожертвование помогает оплачивать техническую инфраструктуру "
+        "и развивать служение. Доступ к библейским ответам и молитве "
+        "не зависит от пожертвования."
+    )
+    markup = InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton(
+                    "🤝 Поддержать проект",
+                    callback_data="donate",
+                )
+            ]
+        ]
+    )
+
+    try:
+        message = await bot.send_message(
+            chat_id=telegram_user_id,
+            text=text,
+            reply_markup=markup,
+        )
+        await analytics_log_event(
+            telegram_user_id,
+            "support_message_created",
+        )
+
+        try:
+            await bot.pin_chat_message(
+                chat_id=telegram_user_id,
+                message_id=message.message_id,
+                disable_notification=True,
+            )
+            await analytics_log_event(
+                telegram_user_id,
+                "support_pin_success",
+            )
+        except (BadRequest, Forbidden):
+            logger.info(
+                "Не удалось закрепить сообщение поддержки для %s",
+                telegram_user_id,
+            )
+            await analytics_log_event(
+                telegram_user_id,
+                "support_pin_failed",
+            )
+
+    except (BadRequest, Forbidden):
+        logger.info(
+            "Не удалось отправить сообщение поддержки пользователю %s",
+            telegram_user_id,
+        )
+
+
+async def send_today_daily_to_user(
+    application: Application,
+    telegram_user_id: int,
+    *,
+    manual: bool = False,
+) -> bool:
+    date_key = daily_date_key()
+    sent_event = daily_sent_event(date_key)
+
+    if not manual and await analytics_has_event(
+        telegram_user_id,
+        sent_event,
+    ):
+        return False
+
+    subscribed = await daily_is_subscribed(
+        telegram_user_id
+    )
+
+    _, word = await get_or_generate_daily_word(
+        date_key
+    )
+
+    await send_daily_word_to_chat(
+        application.bot,
+        telegram_user_id,
+        word,
+        subscribed=subscribed,
+    )
+
+    if not await analytics_has_event(
+        telegram_user_id,
+        sent_event,
+    ):
+        await analytics_log_event(
+            telegram_user_id,
+            sent_event,
+        )
+
+    await analytics_log_event(
+        telegram_user_id,
+        "daily_manual" if manual else "daily_auto",
+    )
+    return True
+
+
+async def daily_broadcast(
+    application: Application,
+    date_key: str,
+) -> None:
+    subscribers = await daily_get_active_subscriber_ids()
+    if not subscribers:
+        return
+
+    sent = await daily_get_sent_user_ids(date_key)
+    targets = sorted(subscribers - sent)
+    if not targets:
+        return
+
+    _, word = await get_or_generate_daily_word(date_key)
+
+    logger.info(
+        "Ежедневное Слово: отправка %s пользователям",
+        len(targets),
+    )
+
+    for user_id in targets:
+        try:
+            await send_daily_word_to_chat(
+                application.bot,
+                user_id,
+                word,
+                subscribed=True,
+            )
+            await analytics_log_event(
+                user_id,
+                daily_sent_event(date_key),
+            )
+            await analytics_log_event(
+                user_id,
+                "daily_auto",
+            )
+            await asyncio.sleep(0.08)
+        except Forbidden:
+            logger.info(
+                "Пользователь %s заблокировал бота",
+                user_id,
+            )
+            await analytics_log_event(
+                user_id,
+                "daily_delivery_forbidden",
+            )
+        except (BadRequest, NetworkError, TimedOut):
+            logger.exception(
+                "Не удалось отправить ежедневное Слово пользователю %s",
+                user_id,
+            )
+
+
+async def daily_scheduler_loop(
+    application: Application,
+) -> None:
+    processed_date: str | None = None
+
+    await asyncio.sleep(3)
+    while True:
+        try:
+            now = datetime.now(DAILY_TIMEZONE)
+            date_key = daily_date_key(now)
+            due = (
+                now.hour > DAILY_SEND_HOUR
+                or (
+                    now.hour == DAILY_SEND_HOUR
+                    and now.minute >= DAILY_SEND_MINUTE
+                )
+            )
+
+            if due and processed_date != date_key:
+                await daily_broadcast(
+                    application,
+                    date_key,
+                )
+                processed_date = date_key
+
+            if not due and processed_date == date_key:
+                processed_date = None
+
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception(
+                "Ошибка фоновой ежедневной рассылки"
+            )
+
+        await asyncio.sleep(
+            DAILY_SCHEDULER_INTERVAL_SECONDS
+        )
+
+
+async def daily_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    message = update.effective_message
+    user = update.effective_user
+    if not message or not user:
+        return
+
+    subscribed = await daily_is_subscribed(user.id)
+    status = (
+        "включена"
+        if subscribed
+        else "выключена"
+    )
+    await message.reply_text(
+        "🌅 Слово на каждый день\n\n"
+        f"Ежедневная рассылка сейчас {status}.\n"
+        "При включении новое размышление приходит каждый день "
+        "примерно в 07:10 по времени Германии.\n\n"
+        "Каждый день выбирается новая тема Писания; бот хранит историю "
+        "тем и избегает повторов.",
+        reply_markup=daily_settings_menu(subscribed),
+    )
+
+
+async def handle_daily_action(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    action: str,
+) -> None:
+    query = update.callback_query
+    user = update.effective_user
+    if not query or not query.message or not user:
+        return
+
+    if action == "daily":
+        subscribed = await daily_is_subscribed(user.id)
+        status = "включена" if subscribed else "выключена"
+        await query.message.reply_text(
+            "🌅 Слово на каждый день\n\n"
+            f"Ежедневная рассылка сейчас {status}.\n\n"
+            "В 07:10 по времени Германии бот присылает новое глубокое "
+            "размышление: место Писания, объяснение, библейское "
+            "свидетельство Божьей славы, 3 шага на день и короткую молитву.\n\n"
+            "Темы сохраняются в истории, чтобы не повторять недавние "
+            "отрывки и сюжеты.",
+            reply_markup=daily_settings_menu(subscribed),
+        )
+        return
+
+    if action == "daily_subscribe":
+        if not await daily_is_subscribed(user.id):
+            await analytics_log_event(
+                user.id,
+                "daily_subscribe",
+            )
+        await query.message.reply_text(
+            "🔔 Ежедневное Слово включено.\n\n"
+            "Теперь каждый день примерно в 07:10 по времени Германии "
+            "вы будете получать новое библейское размышление. "
+            "Отключить рассылку можно в любой момент одной кнопкой."
+        )
+        await ensure_support_pin_for_chat(
+            context.bot,
+            user.id,
+        )
+        try:
+            await send_today_daily_to_user(
+                context.application,
+                user.id,
+                manual=True,
+            )
+        except Exception:
+            logger.exception(
+                "Не удалось отправить Слово сразу после подписки"
+            )
+        return
+
+    if action == "daily_unsubscribe":
+        if await daily_is_subscribed(user.id):
+            await analytics_log_event(
+                user.id,
+                "daily_unsubscribe",
+            )
+        await query.message.reply_text(
+            "🔕 Ежедневная рассылка отключена.\n\n"
+            "Вы по-прежнему можете в любой момент открыть «Слово на "
+            "каждый день» в меню и прочитать Слово на сегодня.",
+            reply_markup=daily_settings_menu(False),
+        )
+        return
+
+    if action == "daily_today":
+        wait = await query.message.reply_text(
+            "📖 Готовлю Слово на сегодня..."
+        )
+        try:
+            await send_today_daily_to_user(
+                context.application,
+                user.id,
+                manual=True,
+            )
+            try:
+                await wait.delete()
+            except Exception:
+                pass
+        except Exception:
+            logger.exception(
+                "Не удалось сформировать Слово на сегодня"
+            )
+            try:
+                await wait.edit_text(
+                    "⚠️ Сейчас не удалось подготовить Слово на сегодня. "
+                    "Попробуйте ещё раз через несколько секунд."
+                )
+            except Exception:
+                pass
+        return
 
 async def analytics_exact_count(
     table: str,
@@ -2065,6 +2991,15 @@ async def stats_command(
         },
     )
 
+    daily_subscribers = len(
+        await daily_get_active_subscriber_ids()
+    )
+    daily_sent_today = len(
+        await daily_get_sent_user_ids(
+            daily_date_key()
+        )
+    )
+
     source_names = [
         ("Instagram", "instagram"),
         ("Instagram Stories", "instagram_story"),
@@ -2147,7 +3082,9 @@ async def stats_command(
         f"• Новые за 24 часа: {new_24h}\n"
         f"• Новые за 7 дней: {new_7d}\n"
         f"• Новые за 30 дней: {new_30d}\n"
-        f"• Активные за 7 дней: {active_7d}\n\n"
+        f"• Активные за 7 дней: {active_7d}\n"
+        f"• Подписаны на ежедневное Слово: {daily_subscribers}\n"
+        f"• Получили Слово сегодня: {daily_sent_today}\n\n"
         "📍 Источники\n"
         + "\n".join(source_lines)
         + "\n\n"
@@ -2660,6 +3597,12 @@ async def start(
         parse_mode="HTML",
     )
 
+    if user:
+        await ensure_support_pin_for_chat(
+            context.bot,
+            user.id,
+        )
+
 
 async def button_handler(
     update: Update,
@@ -2688,6 +3631,19 @@ async def button_handler(
                 ),
             )
         )
+
+    if action in {
+        "daily",
+        "daily_subscribe",
+        "daily_unsubscribe",
+        "daily_today",
+    }:
+        await handle_daily_action(
+            update,
+            context,
+            action,
+        )
+        return
 
     if not action.startswith("don_custom_"):
         context.user_data.pop(
@@ -3315,6 +4271,10 @@ async def post_init(
 ) -> None:
     await verify_supabase_connection()
     await verify_analytics_connection()
+    asyncio.create_task(
+        daily_scheduler_loop(application),
+        name="daily_word_scheduler",
+    )
 
 
 async def error_handler(
@@ -3425,6 +4385,13 @@ def main() -> None:
         CommandHandler(
             "links",
             links_command,
+        )
+    )
+
+    application.add_handler(
+        CommandHandler(
+            "daily",
+            daily_command,
         )
     )
 
