@@ -49,6 +49,7 @@ SUPABASE_SECRET_KEY = "".join(
 SUPABASE_TABLE = "bible_bot_user_state"
 ANALYTICS_USERS_TABLE = "bible_bot_users"
 ANALYTICS_EVENTS_TABLE = "bible_bot_events"
+DAILY_MESSAGES_TABLE = "bible_bot_daily_messages"
 SUPABASE_TIMEOUT_SECONDS = 10.0
 OPENAI_TIMEOUT_SECONDS = 120.0
 VOICE_TRANSCRIPTION_MODEL = os.environ.get(
@@ -63,8 +64,9 @@ MAX_VOICE_FILE_BYTES = 20 * 1024 * 1024
 DAILY_TIMEZONE = ZoneInfo("Europe/Berlin")
 DAILY_SEND_HOUR = 7
 DAILY_SEND_MINUTE = 10
-DAILY_TOPIC_HISTORY_LIMIT = 10000
 DAILY_TOPIC_PROMPT_LIMIT = 365
+DAILY_GENERATION_MAX_ATTEMPTS = 8
+DAILY_WORD_HARD_MAX_WORDS = 450
 DAILY_SYSTEM_USER_ID = 0
 DAILY_SCHEDULER_INTERVAL_SECONDS = 60
 DAILY_WORD_CACHE: dict[str, tuple[str, str]] = {}
@@ -2015,30 +2017,147 @@ async def daily_get_sent_user_ids(
     return result
 
 
-async def daily_get_recent_topic_keys() -> list[str]:
-    rows = await analytics_fetch_events(
-        {
-            "telegram_user_id": f"eq.{DAILY_SYSTEM_USER_ID}",
-            "event_name": "like.daily_topic_*",
-        },
-        order="created_at.desc",
-        max_rows=DAILY_TOPIC_HISTORY_LIMIT,
-    )
+async def daily_get_used_topic_keys() -> list[str]:
+    """
+    Возвращает полную историю использованных основных отрывков.
+
+    Новые ежедневные тексты хранятся в bible_bot_daily_messages.
+    Старые темы, созданные до этого обновления, дополнительно читаются
+    из bible_bot_events. При ошибке проверки история считается
+    недоступной и новое Слово не публикуется: лучше пропустить отправку,
+    чем случайно повторить уже использованный отрывок.
+    """
+    if not supabase_is_configured():
+        raise RuntimeError(
+            "Supabase недоступен: нельзя проверить историю ежедневных отрывков"
+        )
 
     keys: list[str] = []
-    for row in rows:
-        event_name = row.get("event_name")
-        if not isinstance(event_name, str):
-            continue
-        match = re.match(
-            r"daily_topic_\d{4}_\d{2}_\d{2}_(.+)$",
-            event_name,
+    seen: set[str] = set()
+
+    async def add_key(value) -> None:
+        if not isinstance(value, str):
+            return
+        key = value.strip().lower().strip("_")
+        if key and key not in seen:
+            seen.add(key)
+            keys.append(key)
+
+    # Постоянная история новых публикаций.
+    messages_url = (
+        f"{SUPABASE_URL}/rest/v1/"
+        f"{DAILY_MESSAGES_TABLE}"
+    )
+
+    try:
+        async with httpx.AsyncClient(
+            timeout=SUPABASE_TIMEOUT_SECONDS,
+        ) as client:
+            offset = 0
+            page_size = 1000
+            while True:
+                response = await client.get(
+                    messages_url,
+                    headers=supabase_headers(),
+                    params={
+                        "select": "verse_reference",
+                        "order": "created_at.desc",
+                        "limit": str(page_size),
+                        "offset": str(offset),
+                    },
+                )
+                response.raise_for_status()
+                rows = response.json()
+                if not isinstance(rows, list):
+                    raise ValueError("Некорректный ответ daily_messages")
+
+                for row in rows:
+                    await add_key(row.get("verse_reference"))
+
+                if len(rows) < page_size:
+                    break
+                offset += len(rows)
+
+            # Наследуем темы, которые уже были опубликованы старой версией.
+            events_url = (
+                f"{SUPABASE_URL}/rest/v1/"
+                f"{ANALYTICS_EVENTS_TABLE}"
+            )
+            offset = 0
+            while True:
+                response = await client.get(
+                    events_url,
+                    headers=supabase_headers(),
+                    params={
+                        "telegram_user_id": f"eq.{DAILY_SYSTEM_USER_ID}",
+                        "event_name": "like.daily_topic_*",
+                        "select": "event_name",
+                        "order": "created_at.desc",
+                        "limit": str(page_size),
+                        "offset": str(offset),
+                    },
+                )
+                response.raise_for_status()
+                rows = response.json()
+                if not isinstance(rows, list):
+                    raise ValueError("Некорректный ответ analytics events")
+
+                for row in rows:
+                    event_name = row.get("event_name")
+                    if not isinstance(event_name, str):
+                        continue
+                    match = re.match(
+                        r"daily_topic_\d{4}_\d{2}_\d{2}_(.+)$",
+                        event_name,
+                    )
+                    if match:
+                        await add_key(match.group(1))
+
+                if len(rows) < page_size:
+                    break
+                offset += len(rows)
+
+    except (
+        httpx.TimeoutException,
+        httpx.NetworkError,
+        httpx.HTTPStatusError,
+        ValueError,
+    ) as exc:
+        logger.exception(
+            "Не удалось проверить постоянную историю ежедневных отрывков"
         )
-        if match:
-            key = match.group(1).strip("_")
-            if key and key not in keys:
-                keys.append(key)
+        raise RuntimeError(
+            "Не удалось проверить историю ежедневных отрывков"
+        ) from exc
+
     return keys
+
+
+def daily_reference_scope(reference_key: str) -> str:
+    """
+    Нормализует основной отрывок до книги и главы.
+
+    Это дополнительная защита: после использования места из Луки 24
+    бот не сможет позже обойти проверку, назвав тот же сюжет
+    luke_24_32 вместо luke_24_13_35 (или наоборот).
+    """
+    parts = [p for p in reference_key.lower().split("_") if p]
+    if len(parts) < 2:
+        return reference_key.lower()
+
+    search_from = 1 if parts[0] in {"1", "2", "3"} else 0
+    chapter_index = None
+    for index in range(search_from, len(parts)):
+        if parts[index].isdigit():
+            chapter_index = index
+            break
+
+    if chapter_index is None or chapter_index == 0:
+        return reference_key.lower()
+
+    book = "_".join(parts[:chapter_index])
+    chapter = parts[chapter_index]
+    return f"{book}_{chapter}"
 
 
 async def daily_get_today_topic_key(
@@ -2065,6 +2184,176 @@ async def daily_get_today_topic_key(
 
     key = event_name[len(prefix):].strip("_")
     return key or None
+
+
+
+def daily_publish_date(date_key: str) -> str:
+    return date_key.replace("_", "-")
+
+
+def daily_extract_title(body: str, fallback: str) -> str:
+    for raw_line in body.splitlines():
+        line = raw_line.strip()
+        if line.startswith("🔥"):
+            title = line.lstrip("🔥").strip()
+            if title:
+                return title[:300]
+    return fallback[:300]
+
+
+async def daily_load_stored_word(
+    date_key: str,
+) -> tuple[str, str] | None:
+    """Загружает уже утверждённое Слово на конкретную дату."""
+    if not supabase_is_configured():
+        raise RuntimeError(
+            "Supabase недоступен: нельзя безопасно загрузить ежедневное Слово"
+        )
+
+    url = (
+        f"{SUPABASE_URL}/rest/v1/"
+        f"{DAILY_MESSAGES_TABLE}"
+    )
+    try:
+        async with httpx.AsyncClient(
+            timeout=SUPABASE_TIMEOUT_SECONDS,
+        ) as client:
+            response = await client.get(
+                url,
+                headers=supabase_headers(),
+                params={
+                    "publish_date": f"eq.{daily_publish_date(date_key)}",
+                    "select": "verse_reference,body",
+                    "limit": "1",
+                },
+            )
+            response.raise_for_status()
+        rows = response.json()
+        if not isinstance(rows, list):
+            raise ValueError("Некорректный ответ daily_messages")
+        if not rows:
+            return None
+
+        key = str(rows[0].get("verse_reference") or "").strip().lower()
+        body = str(rows[0].get("body") or "").strip()
+        if key and body:
+            return key, body
+        return None
+
+    except (
+        httpx.TimeoutException,
+        httpx.NetworkError,
+        httpx.HTTPStatusError,
+        ValueError,
+    ) as exc:
+        logger.exception(
+            "Не удалось загрузить сохранённое ежедневное Слово"
+        )
+        raise RuntimeError(
+            "Не удалось загрузить сохранённое ежедневное Слово"
+        ) from exc
+
+
+async def daily_store_word(
+    date_key: str,
+    reference_key: str,
+    body: str,
+) -> bool:
+    """
+    Сохраняет Слово до отправки.
+
+    UNIQUE-индексы Supabase по verse_reference и title — последний
+    уровень защиты от повторов. False означает конфликт уникальности.
+    """
+    if not supabase_is_configured():
+        raise RuntimeError(
+            "Supabase недоступен: нельзя безопасно сохранить ежедневное Слово"
+        )
+
+    url = (
+        f"{SUPABASE_URL}/rest/v1/"
+        f"{DAILY_MESSAGES_TABLE}"
+    )
+    payload = {
+        "publish_date": daily_publish_date(date_key),
+        "verse_reference": reference_key.lower(),
+        "title": daily_extract_title(body, reference_key),
+        "body": body,
+    }
+
+    try:
+        async with httpx.AsyncClient(
+            timeout=SUPABASE_TIMEOUT_SECONDS,
+        ) as client:
+            response = await client.post(
+                url,
+                headers=supabase_headers(),
+                json=payload,
+            )
+
+        if response.status_code == 409:
+            return False
+
+        response.raise_for_status()
+        return True
+
+    except httpx.HTTPStatusError as exc:
+        if exc.response.status_code == 409:
+            return False
+        logger.exception("Не удалось сохранить ежедневное Слово")
+        raise RuntimeError("Не удалось сохранить ежедневное Слово") from exc
+    except (
+        httpx.TimeoutException,
+        httpx.NetworkError,
+    ) as exc:
+        logger.exception("Не удалось сохранить ежедневное Слово")
+        raise RuntimeError("Не удалось сохранить ежедневное Слово") from exc
+
+
+def daily_word_count(text: str) -> int:
+    return len(re.findall(r"\S+", text or ""))
+
+
+async def daily_compress_if_needed(text: str) -> str:
+    """Жёстко удерживает ежедневный текст в мобильном формате."""
+    result = clean_ai_text(text)
+    if daily_word_count(result) <= DAILY_WORD_HARD_MAX_WORDS:
+        return result
+
+    instructions = """
+Ты — строгий редактор ежедневного библейского текста для Telegram.
+
+Сожми текст до 320–410 слов. Абсолютный максимум — 450 слов.
+Сохрани:
+• главное место Писания;
+• сильный заголовок;
+• одну центральную духовную мысль;
+• короткое «🌿 Свидетельство Божьей славы», прямо связанное с темой;
+• ровно 3 коротких шага «✅ На сегодня»;
+• молитву из 2–3 предложений.
+
+Удали повторы, длинные вводные и второстепенные объяснения.
+Не добавляй новых библейских фактов и не меняй смысл.
+Обычный текст без Markdown. Верни только готовый текст.
+"""
+
+    for _ in range(2):
+        response = await openai_client.responses.create(
+            model=MODEL,
+            instructions=instructions,
+            input=result,
+            max_output_tokens=1700,
+        )
+        candidate = clean_ai_text(response.output_text or "")
+        if candidate:
+            result = candidate
+        if daily_word_count(result) <= DAILY_WORD_HARD_MAX_WORDS:
+            return result
+
+    # Fail closed: длинный материал лучше не отправить, чем нарушить формат.
+    raise RuntimeError(
+        "Ежедневное Слово не удалось сократить до установленной длины"
+    )
 
 
 def parse_daily_generation(
@@ -2131,8 +2420,9 @@ async def generate_daily_word(
 • центр надежды — Иисус Христос, Божья верность и послушание Слову;
 • русский язык, обычный текст без Markdown-символов **, ### и обратных кавычек.
 
-Длина всего BODY: примерно 380–520 слов и не больше 600 слов.
-Не повторяй одну мысль разными словами.
+Длина всего BODY: 320–410 слов. Абсолютный максимум — 450 слов.
+Текст должен читаться примерно за 2–3 минуты на телефоне.
+Не повторяй одну мысль разными словами. Один день — одна центральная мысль.
 
 Структура BODY:
 📖 Слово на сегодня
@@ -2142,28 +2432,33 @@ async def generate_daily_word(
 
 🔥 Сильный уникальный заголовок
 
-Основное размышление: объясни контекст, духовный принцип и связь с
-реальной жизнью человека. Пиши так, чтобы текст был понятен и новичку,
-и человеку, давно читающему Библию.
+Основное размышление: 3–4 плотных абзаца. Объясни контекст, главный
+духовный принцип и связь с реальной жизнью. Не повторяй вывод разными
+формулировками и не превращай один день во вторую длинную проповедь.
 
 🌿 Свидетельство Божьей славы
-Коротко покажи реальный библейский эпизод, где видна Божья верность,
-сила, милость, освобождение, восстановление или водительство. Не выдавай
+70–100 слов. Покажи один реальный библейский эпизод, который прямо
+усиливает центральную тему дня. Это не отдельная вторая тема. Не выдавай
 человеческое предположение за факт Писания.
 
 ✅ На сегодня
 Дай ровно 3 коротких практических шага, пронумерованных (1), (2), (3).
+Каждый шаг — максимум одно короткое предложение.
 
 🙏 Молитва
-2–4 предложения, Христоцентрично и по теме дня.
+2–3 предложения, Христоцентрично и строго по теме дня.
 
 Верни ответ строго в формате:
 REFERENCE_KEY: english_book_chapter_verse
 BODY:
 <готовое размышление>
 
-REFERENCE_KEY должен быть только латиницей, цифрами и подчёркиваниями,
-например: joshua_6_1 или romans_8_31_39.
+REFERENCE_KEY должен быть только латиницей, цифрами и подчёркиваниями.
+Он обязан обозначать весь ОСНОВНОЙ отрывок/сюжет, а не случайный один
+стих внутри него. Например, для дороги в Эммаус используй
+luke_24_13_35, даже если в начале цитируется только Луки 24:32.
+Для одного самостоятельного стиха допустим ключ вроде joshua_6_1.
+Один и тот же основной отрывок всегда должен получать один и тот же ключ.
 """
 
     base_input = (
@@ -2176,7 +2471,10 @@ REFERENCE_KEY должен быть только латиницей, цифра�
     last_key: str | None = None
     last_body = ""
 
-    for _ in range(3):
+    used_keys = set(recent_topic_keys)
+    used_scopes = {daily_reference_scope(item) for item in recent_topic_keys}
+
+    for _ in range(DAILY_GENERATION_MAX_ATTEMPTS):
         response = await openai_client.responses.create(
             model=MODEL,
             instructions=generation_instructions,
@@ -2197,15 +2495,23 @@ REFERENCE_KEY должен быть только латиницей, цифра�
             and body
             and (
                 forced_reference_key
-                or key not in set(recent_topic_keys)
+                or (
+                    key not in used_keys
+                    and daily_reference_scope(key) not in used_scopes
+                )
             )
         ):
             last_key = key
             break
 
+        if key and not forced_reference_key:
+            used_keys.add(key)
+            used_scopes.add(daily_reference_scope(key))
+
         base_input += (
-            "\n\nПредыдущая попытка повторила тему или нарушила формат. "
-            "Выбери другое библейское место и верни точный формат."
+            "\n\nПредыдущая попытка повторила уже использованный основной "
+            "отрывок/главу либо нарушила формат. Выбери другое место "
+            "Писания и верни точный формат."
         )
 
     if not last_key or not last_body:
@@ -2227,7 +2533,8 @@ REFERENCE_KEY должен быть только латиницей, цифра�
   определённого исхода там, где Писание этого не обещает;
 • сохрани сильный, живой, пастырский тон и призыв к вере и послушанию;
 • сохрани структуру, 3 практических шага и короткую молитву;
-• итог 380–520 слов, максимум 600;
+• итог 320–410 слов, абсолютный максимум 450;
+• «Свидетельство Божьей славы» короткое и прямо поддерживает центральную тему;
 • обычный текст без Markdown-разметки.
 
 Верни только готовый текст для Telegram, без комментариев редактора.
@@ -2249,6 +2556,8 @@ REFERENCE_KEY должен быть только латиницей, цифра�
     if audited:
         last_body = audited
 
+    last_body = await daily_compress_if_needed(last_body)
+
     return last_key, last_body
 
 
@@ -2264,34 +2573,73 @@ async def get_or_generate_daily_word(
         if cached:
             return cached
 
+        # Один день — один утверждённый текст для всех пользователей.
+        stored = await daily_load_stored_word(date_key)
+        if stored:
+            DAILY_WORD_CACHE[date_key] = stored
+            return stored
+
+        used = await daily_get_used_topic_keys()
         today_key = await daily_get_today_topic_key(date_key)
-        recent = await daily_get_recent_topic_keys()
 
+        # Если сегодняшняя тема уже была создана предыдущей версией кода,
+        # сохраняем именно её, но уже в новом компактном формате.
         if today_key:
-            result = await generate_daily_word(
+            key, body = await generate_daily_word(
                 forced_reference_key=today_key,
-                recent_topic_keys=recent,
+                recent_topic_keys=used,
             )
-            DAILY_WORD_CACHE[date_key] = result
-            return result
+            saved = await daily_store_word(date_key, key, body)
+            if saved:
+                result = (key, body)
+                DAILY_WORD_CACHE[date_key] = result
+                return result
 
-        key, body = await generate_daily_word(
-            recent_topic_keys=recent,
+            stored = await daily_load_stored_word(date_key)
+            if stored:
+                DAILY_WORD_CACHE[date_key] = stored
+                return stored
+
+            raise RuntimeError(
+                "Не удалось безопасно сохранить сегодняшнее Слово"
+            )
+
+        working_used = list(used)
+
+        for _ in range(DAILY_GENERATION_MAX_ATTEMPTS):
+            key, body = await generate_daily_word(
+                recent_topic_keys=working_used,
+            )
+
+            saved = await daily_store_word(date_key, key, body)
+            if saved:
+                await analytics_log_event(
+                    DAILY_SYSTEM_USER_ID,
+                    f"{daily_topic_prefix(date_key)}{key}",
+                )
+                result = (key, body)
+                DAILY_WORD_CACHE[date_key] = result
+
+                if len(DAILY_WORD_CACHE) > 3:
+                    for old_key in sorted(DAILY_WORD_CACHE)[:-3]:
+                        DAILY_WORD_CACHE.pop(old_key, None)
+
+                return result
+
+            # Если конфликт был по дате — другой процесс уже успел сохранить
+            # сегодняшний текст. Берём его, не создавая второй вариант.
+            stored = await daily_load_stored_word(date_key)
+            if stored:
+                DAILY_WORD_CACHE[date_key] = stored
+                return stored
+
+            # Иначе конфликт был по отрывку/заголовку — пробуем новую тему.
+            if key not in working_used:
+                working_used.append(key)
+
+        raise RuntimeError(
+            "Не удалось подобрать новый, ранее не использованный отрывок"
         )
-
-        await analytics_log_event(
-            DAILY_SYSTEM_USER_ID,
-            f"{daily_topic_prefix(date_key)}{key}",
-        )
-        result = (key, body)
-        DAILY_WORD_CACHE[date_key] = result
-
-        # Держим в памяти только несколько последних дней.
-        if len(DAILY_WORD_CACHE) > 3:
-            for old_key in sorted(DAILY_WORD_CACHE)[:-3]:
-                DAILY_WORD_CACHE.pop(old_key, None)
-
-        return result
 
 
 def daily_post_menu(
@@ -2626,8 +2974,8 @@ async def daily_command(
         f"Ежедневная рассылка сейчас {status}.\n"
         "При включении новое размышление приходит каждый день "
         "примерно в 07:10 по времени Германии.\n\n"
-        "Каждый день выбирается новая тема Писания; бот хранит историю "
-        "тем и избегает повторов.",
+        "Каждый день выбирается новый основной отрывок Писания; уже "
+        "использованные отрывки повторно не используются.",
         reply_markup=daily_settings_menu(subscribed),
     )
 
@@ -2651,8 +2999,8 @@ async def handle_daily_action(
             "В 07:10 по времени Германии бот присылает новое глубокое "
             "размышление: место Писания, объяснение, библейское "
             "свидетельство Божьей славы, 3 шага на день и короткую молитву.\n\n"
-            "Темы сохраняются в истории, чтобы не повторять недавние "
-            "отрывки и сюжеты.",
+            "Использованные основные отрывки сохраняются в постоянной истории "
+            "и больше не используются повторно.",
             reply_markup=daily_settings_menu(subscribed),
         )
         return
