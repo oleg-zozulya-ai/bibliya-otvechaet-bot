@@ -6,6 +6,7 @@ import re
 from decimal import Decimal, InvalidOperation
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
+from urllib.parse import quote
 
 import httpx
 from openai import AsyncOpenAI
@@ -1482,6 +1483,12 @@ def main_menu() -> InlineKeyboardMarkup:
             ],
             [
                 InlineKeyboardButton(
+                    "📤 Поделиться ботом",
+                    callback_data="share",
+                )
+            ],
+            [
+                InlineKeyboardButton(
                     "🤝 Поддержать служение",
                     callback_data="donate",
                 )
@@ -1576,6 +1583,7 @@ def analytics_event_for_action(
         "daily_subscribe": "daily_subscribe_click",
         "daily_unsubscribe": "daily_unsubscribe_click",
         "daily_today": "daily_today_click",
+        "share": "share_open",
         "about": "menu_about",
         "menu": "menu_home",
     }
@@ -2660,6 +2668,12 @@ def daily_post_menu(
         ],
         [
             InlineKeyboardButton(
+                "📤 Поделиться ботом",
+                callback_data="share",
+            )
+        ],
+        [
+            InlineKeyboardButton(
                 "🤝 Поддержать проект",
                 callback_data="donate",
             )
@@ -3266,6 +3280,16 @@ async def links_command(
         f"{base}?start=blessunited\n\n"
         f"Facebook:\n"
         f"{base}?start=facebook\n\n"
+        f"TikTok:\n"
+        f"{base}?start=tiktok\n\n"
+        f"YouTube Shorts:\n"
+        f"{base}?start=youtube_shorts\n\n"
+        f"Церкви и христианские группы:\n"
+        f"{base}?start=church\n\n"
+        f"QR / печатные материалы:\n"
+        f"{base}?start=qr_print\n\n"
+        f"Рекомендация из Telegram:\n"
+        f"{base}?start=shared\n\n"
         f"Реклама №1:\n"
         f"{base}?start=ad_campaign_1\n\n"
         "Каждая ссылка ведёт в того же бота, "
@@ -3353,6 +3377,11 @@ async def stats_command(
         ("Instagram Stories", "instagram_story"),
         ("Bless United", "blessunited"),
         ("Facebook", "facebook"),
+        ("TikTok", "tiktok"),
+        ("YouTube Shorts", "youtube_shorts"),
+        ("Церкви / группы", "church"),
+        ("QR / печать", "qr_print"),
+        ("Рекомендации", "shared"),
         ("Реклама №1", "ad_campaign_1"),
         ("Прямой запуск", "direct"),
     ]
@@ -3378,6 +3407,7 @@ async def stats_command(
         ("Работа и финансы", "ai_finances"),
         ("Благословение", "ai_blessing"),
         ("Стих из Библии", "menu_verse"),
+        ("Открыли «Поделиться ботом»", "share_open"),
     ]
 
     usage_lines = []
@@ -4080,6 +4110,77 @@ async def button_handler(
             "💬 <b>Коротко о смысле</b>\n"
             f"{verse['thought']}"
         )
+
+    elif action == "share":
+        context.user_data.pop(
+            "mode",
+            None,
+        )
+
+        me = await context.bot.get_me()
+
+        if not me.username:
+            text = (
+                "⚠️ Сейчас не удалось подготовить ссылку для отправки. "
+                "Попробуйте ещё раз позже."
+            )
+            reply_markup = main_menu()
+        else:
+            bot_link = (
+                f"https://t.me/{me.username}?start=shared"
+            )
+            share_text = (
+                "Я пользуюсь бесплатным Telegram-проектом "
+                "«Библия отвечает»: здесь можно задать вопрос по Писанию, "
+                "получить помощь в молитве и читать ежедневное Слово. "
+                "Возможно, он будет полезен и тебе."
+            )
+            telegram_share_url = (
+                "https://t.me/share/url?url="
+                + quote(bot_link, safe="")
+                + "&text="
+                + quote(share_text, safe="")
+            )
+
+            text = (
+                "📤 <b>Поделиться «Библия отвечает»</b>\n\n"
+                "Если бот оказался полезен, вы можете отправить его "
+                "человеку, которому сейчас нужна молитва, поддержка "
+                "или помощь в поиске библейского ответа.\n\n"
+                "Проект остаётся бесплатным. Поделиться ссылкой можно "
+                "без регистрации и без каких-либо обязательств."
+            )
+
+            reply_markup = InlineKeyboardMarkup(
+                [
+                    [
+                        InlineKeyboardButton(
+                            "📤 Отправить в Telegram",
+                            url=telegram_share_url,
+                        )
+                    ],
+                    [
+                        InlineKeyboardButton(
+                            "📋 Скопировать ссылку",
+                            copy_text=CopyTextButton(
+                                text=bot_link,
+                            ),
+                        )
+                    ],
+                    [
+                        InlineKeyboardButton(
+                            "🤝 Поддержать проект",
+                            callback_data="donate",
+                        )
+                    ],
+                    [
+                        InlineKeyboardButton(
+                            "🏠 Главное меню",
+                            callback_data="menu",
+                        )
+                    ],
+                ]
+            )
 
     elif action == "donate":
         context.user_data.pop(
