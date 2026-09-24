@@ -66,7 +66,8 @@ VOICE_TRANSCRIPTION_MODEL = os.environ.get(
 ).strip() or "gpt-4o-transcribe"
 
 # Аудиоответ на входящее голосовое сообщение.
-# Озвучка через ElevenLabs, голос задаётся в Render через ELEVENLABS_VOICE_ID.
+# Озвучка только через ElevenLabs; голос задаётся в Render через ELEVENLABS_VOICE_ID.
+# Другой TTS-провайдер намеренно не используется, чтобы голос не менялся.
 ELEVENLABS_API_KEY = "".join(
     os.environ.get("ELEVENLABS_API_KEY", "").split()
 )
@@ -75,17 +76,23 @@ ELEVENLABS_VOICE_ID = "".join(
 )
 ELEVENLABS_MODEL_ID = os.environ.get(
     "ELEVENLABS_MODEL_ID",
-    "eleven_multilingual_v2",
-).strip() or "eleven_multilingual_v2"
+    "eleven_flash_v2_5",
+).strip() or "eleven_flash_v2_5"
 VOICE_TTS_MAX_CHARS = 1800
-VOICE_TTS_TOTAL_MAX_CHARS = 4500
+# Голосовая версия обычного длинного ответа специально короче письменной:
+# это уменьшает расход ElevenLabs и снижает риск отказа TTS на длинных ответах.
+VOICE_TTS_TOTAL_MAX_CHARS = 1700
 VOICE_TTS_TIMEOUT_SECONDS = 180.0
+VOICE_GENERAL_SPEED = 0.90
+VOICE_LORDS_PRAYER_SPEED = 0.86
+VOICE_GENERAL_INTRO_DELAY_MS = 700
+VOICE_LORDS_PRAYER_INTRO_DELAY_MS = 1000
 VOICE_REPLY_FILENAME = "bibliya_otvechaet.ogg"
 PRAYER_MUSIC_PATH = os.path.join(
     os.path.dirname(os.path.abspath(__file__)),
     "background_musik.m4a",
 )
-PRAYER_MUSIC_VOLUME = 0.12
+PRAYER_MUSIC_VOLUME = 0.16
 
 MAX_VOICE_DURATION_SECONDS = 600
 MAX_VOICE_FILE_BYTES = 20 * 1024 * 1024
@@ -4624,62 +4631,127 @@ def split_tts_text(
 
 
 async def create_tts_mp3(text: str) -> bytes:
-    """Создаёт MP3-озвучку одной части ответа через ElevenLabs."""
+    """Озвучивает текст только через ElevenLabs выбранным Pastor Russian."""
     if not ELEVENLABS_API_KEY:
-        raise RuntimeError(
-            "В Render отсутствует ELEVENLABS_API_KEY"
-        )
+        raise RuntimeError("В Render отсутствует ELEVENLABS_API_KEY")
     if not ELEVENLABS_VOICE_ID:
-        raise RuntimeError(
-            "В Render отсутствует ELEVENLABS_VOICE_ID"
-        )
+        raise RuntimeError("В Render отсутствует ELEVENLABS_VOICE_ID")
+
+    is_lords_prayer = (
+        prepare_tts_text(text) == LORDS_PRAYER_PROJECT_RU
+    )
+    speed = (
+        VOICE_LORDS_PRAYER_SPEED
+        if is_lords_prayer
+        else VOICE_GENERAL_SPEED
+    )
 
     headers = {
         "xi-api-key": ELEVENLABS_API_KEY,
         "Content-Type": "application/json",
         "Accept": "audio/mpeg",
     }
-    is_lords_prayer = (
-        prepare_tts_text(text) == LORDS_PRAYER_PROJECT_RU
-    )
-
     payload = {
         "text": text,
         "model_id": ELEVENLABS_MODEL_ID,
         "voice_settings": {
-            "stability": 0.82 if is_lords_prayer else 0.72,
+            "stability": 0.84 if is_lords_prayer else 0.79,
             "similarity_boost": 0.80,
             "style": 0.0,
             "use_speaker_boost": True,
-            "speed": 0.86 if is_lords_prayer else 0.98,
+            "speed": speed,
         },
     }
-    params = {
-        "output_format": "mp3_44100_128",
-    }
+    params = {"output_format": "mp3_44100_128"}
 
     voice_id = quote(ELEVENLABS_VOICE_ID, safe="")
-    url = (
-        "https://api.elevenlabs.io/v1/text-to-speech/"
-        + voice_id
+    url = "https://api.elevenlabs.io/v1/text-to-speech/" + voice_id
+
+    last_error: Exception | None = None
+    async with httpx.AsyncClient(timeout=VOICE_TTS_TIMEOUT_SECONDS) as client:
+        for attempt in range(3):
+            try:
+                response = await client.post(
+                    url,
+                    headers=headers,
+                    params=params,
+                    json=payload,
+                )
+                if not response.is_error:
+                    return response.content
+
+                detail = response.text[:1200]
+                last_error = RuntimeError(
+                    "ElevenLabs TTS error "
+                    f"{response.status_code}: {detail}"
+                )
+
+                # Повторяем только временные ошибки. При исчерпании кредита,
+                # неверном ключе или Voice ID голос не подменяется другим TTS.
+                if response.status_code not in {
+                    408, 409, 429, 500, 502, 503, 504
+                }:
+                    break
+
+                if attempt < 2:
+                    await asyncio.sleep(1.5 * (attempt + 1))
+            except (httpx.TimeoutException, httpx.NetworkError) as exc:
+                last_error = exc
+                if attempt < 2:
+                    await asyncio.sleep(1.5 * (attempt + 1))
+                    continue
+                break
+
+    raise RuntimeError(
+        "ElevenLabs Pastor Russian временно недоступен. "
+        "Другой голос намеренно не используется. "
+        f"Причина: {last_error}"
     )
 
-    async with httpx.AsyncClient(
-        timeout=VOICE_TTS_TIMEOUT_SECONDS,
-    ) as client:
-        response = await client.post(
-            url,
-            headers=headers,
-            params=params,
-            json=payload,
+
+async def make_spoken_answer(answer: str) -> str:
+    """Делает из длинного письменного ответа короткую естественную аудиоверсию."""
+    prepared = prepare_tts_text(answer)
+    if not prepared:
+        return ""
+    if prepared == LORDS_PRAYER_PROJECT_RU:
+        return prepared
+    if len(prepared) <= VOICE_TTS_TOTAL_MAX_CHARS:
+        return prepared
+
+    instructions = """
+Ты редактор голосового ответа христианского Telegram-бота.
+Сделай из письменного ответа естественную версию для спокойного чтения вслух.
+Сохрани главную библейскую мысль, 1–3 ключевых места Писания и практическое
+ободрение. Удали заголовки, эмодзи, длинные списки и повторы. Не добавляй
+новых фактов и не меняй богословский смысл. Русский язык. Манера зрелого
+пастора: тёплая, спокойная, размеренная. Короткие предложения и естественные
+паузы. Итог — примерно 900–1400 знаков, максимум 1600 знаков. Верни только
+текст для озвучки без пояснений.
+"""
+    try:
+        response = await openai_client.responses.create(
+            model=MODEL,
+            instructions=instructions,
+            input=prepared,
+            max_output_tokens=700,
         )
-        if response.is_error:
-            detail = response.text[:1200]
-            raise RuntimeError(
-                "ElevenLabs TTS error "
-                f"{response.status_code}: {detail}"
-            )
-        return response.content
+        spoken = prepare_tts_text(response.output_text or "")
+        if spoken:
+            return spoken[:VOICE_TTS_TOTAL_MAX_CHARS].rstrip()
+    except Exception:
+        logger.exception("Не удалось подготовить короткую аудиоверсию")
+
+    shortened = prepared[:VOICE_TTS_TOTAL_MAX_CHARS]
+    cut = max(
+        shortened.rfind(". "),
+        shortened.rfind("! "),
+        shortened.rfind("? "),
+        shortened.rfind("\n"),
+    )
+    if cut >= int(VOICE_TTS_TOTAL_MAX_CHARS * 0.65):
+        shortened = shortened[: cut + 1]
+    return shortened.rstrip()
 
 def concatenate_tts_wavs(chunks: list[bytes]) -> bytes:
     """Склеивает WAV-части, вставляя короткую естественную паузу."""
@@ -4754,27 +4826,17 @@ def get_ffmpeg_executable() -> str:
 
 
 async def build_voice_reply_ogg(answer: str) -> bytes:
-    """Создаёт голосовой ответ ElevenLabs с тихой музыкальной подложкой."""
-    prepared = prepare_tts_text(answer)
+    """Создаёт стабильный голосовой ответ с тихой музыкальной подложкой."""
+    prepared = await make_spoken_answer(answer)
     if not prepared:
         raise ValueError("Нет текста для озвучивания")
 
-    if len(prepared) > VOICE_TTS_TOTAL_MAX_CHARS:
-        shortened = prepared[:VOICE_TTS_TOTAL_MAX_CHARS]
-        cut = max(
-            shortened.rfind(". "),
-            shortened.rfind("! "),
-            shortened.rfind("? "),
-            shortened.rfind("\n"),
-        )
-        if cut >= int(VOICE_TTS_TOTAL_MAX_CHARS * 0.7):
-            shortened = shortened[: cut + 1]
-        prepared = (
-            shortened.rstrip()
-            + "\n\nПолный ответ отправлен вам также в текстовом виде."
-        )
-
     is_lords_prayer = (prepared == LORDS_PRAYER_PROJECT_RU)
+    intro_delay_ms = (
+        VOICE_LORDS_PRAYER_INTRO_DELAY_MS
+        if is_lords_prayer
+        else VOICE_GENERAL_INTRO_DELAY_MS
+    )
 
     parts = split_tts_text(prepared)
     if not parts:
@@ -4783,17 +4845,12 @@ async def build_voice_reply_ogg(answer: str) -> bytes:
     music_path = await asyncio.to_thread(ensure_prayer_music)
     ffmpeg = get_ffmpeg_executable()
 
-    with tempfile.TemporaryDirectory(
-        prefix="bibliya_audio_",
-    ) as temp_dir:
+    with tempfile.TemporaryDirectory(prefix="bibliya_audio_") as temp_dir:
         voice_paths: list[str] = []
 
         for index, part in enumerate(parts):
             audio = await create_tts_mp3(part)
-            part_path = os.path.join(
-                temp_dir,
-                f"voice_{index:03d}.mp3",
-            )
+            part_path = os.path.join(temp_dir, f"voice_{index:03d}.mp3")
             with open(part_path, "wb") as file:
                 file.write(audio)
             voice_paths.append(part_path)
@@ -4804,10 +4861,7 @@ async def build_voice_reply_ogg(answer: str) -> bytes:
                 escaped = part_path.replace("'", "'\\''")
                 file.write(f"file '{escaped}'\n")
 
-        output_path = os.path.join(
-            temp_dir,
-            VOICE_REPLY_FILENAME,
-        )
+        output_path = os.path.join(temp_dir, VOICE_REPLY_FILENAME)
 
         command = [
             ffmpeg,
@@ -4827,11 +4881,7 @@ async def build_voice_reply_ogg(answer: str) -> bytes:
             music_path,
             "-filter_complex",
             (
-                (
-                    "[0:a]adelay=1000|1000[voice];"
-                    if is_lords_prayer
-                    else "[0:a]anull[voice];"
-                )
+                f"[0:a]adelay={intro_delay_ms}|{intro_delay_ms}[voice];"
                 + f"[1:a]volume={PRAYER_MUSIC_VOLUME},"
                 "highpass=f=55,lowpass=f=3600[music];"
                 "[voice][music]amix=inputs=2:duration=first:"
@@ -4869,8 +4919,7 @@ async def build_voice_reply_ogg(answer: str) -> bytes:
                 errors="replace",
             )[-2000:]
             raise RuntimeError(
-                "FFmpeg не смог собрать аудиоответ: "
-                + error_text
+                "FFmpeg не смог собрать аудиоответ: " + error_text
             )
 
         with open(output_path, "rb") as file:
@@ -4909,11 +4958,6 @@ async def send_voice_answer_audio(
 
         caption = "🎧 Аудиоверсия ответа"
 
-        if disclosure_needed:
-            caption += (
-                "\n\nℹ️ Аудиоозвучка создана автоматически."
-            )
-
         await message.reply_voice(
             voice=voice_file,
             caption=caption,
@@ -4931,9 +4975,9 @@ async def send_voice_answer_audio(
         logger.exception("Не удалось создать аудиоверсию ответа")
         try:
             await progress.edit_text(
-                "⚠️ Письменный ответ готов, но аудиоверсию "
-                "сейчас создать не удалось. Попробуйте следующее "
-                "голосовое сообщение немного позже."
+                "⚠️ Письменный ответ готов, но голос Pastor Russian "
+                "сейчас временно недоступен. Другой голос не используется. "
+                "Попробуйте немного позже."
             )
         except Exception:
             pass
