@@ -66,7 +66,7 @@ VOICE_TRANSCRIPTION_MODEL = os.environ.get(
 ).strip() or "gpt-4o-transcribe"
 
 # Аудиоответ на входящее голосовое сообщение.
-# По умолчанию используется мягкий голос Shimmer и оригинальная
+# По умолчанию используется взрослый мужской голос Cedar и оригинальная
 # тихая инструментальная молитвенная подложка, генерируемая локально.
 VOICE_TTS_MODEL = os.environ.get(
     "VOICE_TTS_MODEL",
@@ -74,15 +74,15 @@ VOICE_TTS_MODEL = os.environ.get(
 ).strip() or "gpt-4o-mini-tts"
 VOICE_TTS_VOICE = os.environ.get(
     "VOICE_TTS_VOICE",
-    "shimmer",
-).strip() or "shimmer"
-VOICE_TTS_SPEED = 0.92
-VOICE_TTS_MAX_CHARS = 3800
+    "cedar",
+).strip() or "cedar"
+VOICE_TTS_SPEED = 1.0
+VOICE_TTS_MAX_CHARS = 2400
 VOICE_TTS_TIMEOUT_SECONDS = 180.0
 VOICE_REPLY_FILENAME = "bibliya_otvechaet.ogg"
 PRAYER_MUSIC_PATH = os.path.join(
     tempfile.gettempdir(),
-    "bibliya_otvechaet_prayer_pad_v1.wav",
+    "bibliya_otvechaet_prayer_pad_v2.wav",
 )
 
 MAX_VOICE_DURATION_SECONDS = 600
@@ -4524,12 +4524,18 @@ async def create_tts_wav(text: str) -> bytes:
         "voice": VOICE_TTS_VOICE,
         "input": text,
         "instructions": (
-            "Говори на языке текста мягким, тёплым, спокойным женским "
-            "голосом. Тон молитвенный, искренний и поддерживающий, без "
-            "театральности и без излишнего пафоса. Читай немного медленнее "
-            "обычной разговорной речи, делай естественные паузы между "
-            "смысловыми частями и особенно бережно произноси молитву и "
-            "места Писания."
+            "Говори на языке текста естественным взрослым мужским голосом. "
+            "Голос зрелый, спокойный, мудрый, тёплый и уверенный, как у "
+            "внимательного пастырского собеседника. Дикция должна быть "
+            "очень чёткой: ясно произноси окончания, имена, числа, названия "
+            "книг Библии и ссылки на главы и стихи. Не говори роботизированно, "
+            "не растягивай гласные, не делай механических пауз и не используй "
+            "театральную или рекламную манеру. Темп естественный, немного "
+            "созерцательный, но не медленный. Делай короткие живые паузы "
+            "только по смыслу. Если текст русский — используй нейтральное "
+            "естественное русское произношение; если текст на другом языке — "
+            "произноси его естественно для этого языка. Молитву и места "
+            "Писания читай особенно бережно, спокойно и с достоинством."
         ),
         "response_format": "wav",
         "speed": VOICE_TTS_SPEED,
@@ -4584,7 +4590,7 @@ def concatenate_tts_wavs(chunks: list[bytes]) -> bytes:
                 writer.writeframes(reader.readframes(reader.getnframes()))
 
                 if index < len(chunks) - 1:
-                    pause_frames = int(params[2] * 0.28)
+                    pause_frames = int(params[2] * 0.18)
                     writer.writeframes(
                         b"\x00"
                         * pause_frames
@@ -4596,7 +4602,7 @@ def concatenate_tts_wavs(chunks: list[bytes]) -> bytes:
 
 
 def ensure_original_prayer_music() -> str:
-    """Создаёт собственную 24-секундную спокойную музыкальную петлю."""
+    """Создаёт собственную спокойную молитвенную музыкальную петлю."""
     if (
         os.path.exists(PRAYER_MUSIC_PATH)
         and os.path.getsize(PRAYER_MUSIC_PATH) > 1000
@@ -4604,58 +4610,86 @@ def ensure_original_prayer_music() -> str:
         return PRAYER_MUSIC_PATH
 
     sample_rate = 24000
-    chord_seconds = 6.0
+    chord_seconds = 8.0
+
+    # Мягкая гармония: Cmaj7 -> Am7 -> Fmaj7 -> Gsus4.
     chords = [
-        (130.81, 164.81, 196.00),  # C
-        (98.00, 146.83, 196.00),   # G
-        (110.00, 130.81, 164.81),  # Am
-        (87.31, 130.81, 174.61),   # F
+        (130.81, 164.81, 196.00, 246.94),
+        (110.00, 130.81, 164.81, 196.00),
+        (87.31, 130.81, 164.81, 220.00),
+        (98.00, 130.81, 146.83, 196.00),
     ]
+
+    # Редкие верхние ноты дают ощущение спокойного фортепиано/колокольчика.
+    bell_notes = [
+        (2.0, 523.25),
+        (6.0, 659.25),
+        (10.0, 493.88),
+        (14.0, 440.00),
+        (18.0, 523.25),
+        (22.0, 659.25),
+        (26.0, 587.33),
+        (30.0, 523.25),
+    ]
+
     samples = array("h")
+    total_seconds = chord_seconds * len(chords)
+    total_samples = int(sample_rate * total_seconds)
 
-    for chord_index, chord in enumerate(chords):
-        total = int(sample_rate * chord_seconds)
+    for i in range(total_samples):
+        t = i / sample_rate
+        chord_index = min(int(t // chord_seconds), len(chords) - 1)
+        local_t = t - chord_index * chord_seconds
+        chord = chords[chord_index]
 
-        for i in range(total):
-            local_t = i / sample_rate
-            global_t = chord_index * chord_seconds + local_t
-            fade = min(
-                1.0,
-                local_t / 1.0,
-                (chord_seconds - local_t) / 1.0,
+        edge = min(
+            1.0,
+            local_t / 1.8,
+            (chord_seconds - local_t) / 1.8,
+        )
+        edge = max(0.0, edge)
+
+        slow_breathe = 0.90 + 0.10 * math.sin(
+            2.0 * math.pi * 0.045 * t
+        )
+
+        pad = 0.0
+        for note_index, frequency in enumerate(chord):
+            phase = note_index * 0.55
+            pad += 0.62 * math.sin(
+                2.0 * math.pi * frequency * t + phase
             )
-            fade = max(0.0, fade)
-            breathe = 0.82 + 0.18 * math.sin(
-                2.0 * math.pi * 0.07 * global_t
+            pad += 0.13 * math.sin(
+                2.0 * math.pi * frequency * 2.0 * t + phase
             )
 
-            tone = 0.0
-            for note_index, frequency in enumerate(chord):
-                phase = note_index * 0.7
-                tone += 0.68 * math.sin(
-                    2.0 * math.pi * frequency * local_t + phase
+        pad /= 4.0
+
+        # Очень мягкий низ без гула.
+        root = 0.20 * math.sin(
+            2.0 * math.pi * (chord[0] / 2.0) * t
+        )
+
+        bell = 0.0
+        for onset, frequency in bell_notes:
+            dt = t - onset
+            if 0.0 <= dt <= 2.5:
+                envelope = math.exp(-2.2 * dt)
+                bell += envelope * (
+                    0.70 * math.sin(2.0 * math.pi * frequency * dt)
+                    + 0.20 * math.sin(
+                        2.0 * math.pi * frequency * 2.0 * dt
+                    )
                 )
-                tone += 0.22 * math.sin(
-                    2.0
-                    * math.pi
-                    * (frequency * 2.0)
-                    * local_t
-                    + phase
-                )
 
-            # Очень тихий низкий корень создаёт ощущение мягкой подложки.
-            tone += 0.30 * math.sin(
-                2.0 * math.pi * (chord[0] / 2.0) * local_t
-            )
+        tone = (
+            0.78 * pad * edge * slow_breathe
+            + 0.12 * root * edge
+            + 0.10 * bell
+        )
 
-            value = int(
-                32767
-                * 0.11
-                * fade
-                * breathe
-                * (tone / 3.7)
-            )
-            samples.append(max(-32768, min(32767, value)))
+        value = int(32767 * 0.085 * tone)
+        samples.append(max(-32768, min(32767, value)))
 
     temp_path = (
         PRAYER_MUSIC_PATH
@@ -4677,7 +4711,6 @@ def ensure_original_prayer_music() -> str:
                 pass
 
     return PRAYER_MUSIC_PATH
-
 
 def get_ffmpeg_executable() -> str:
     """Берёт FFmpeg из imageio-ffmpeg, с системным FFmpeg как fallback."""
@@ -4737,7 +4770,7 @@ async def build_voice_reply_ogg(answer: str) -> bytes:
             music_path,
             "-filter_complex",
             (
-                "[1:a]volume=0.22,highpass=f=55,lowpass=f=1500[music];"
+                "[1:a]volume=0.13,highpass=f=70,lowpass=f=4200[music];"
                 "[0:a][music]amix=inputs=2:duration=first:"
                 "dropout_transition=2:normalize=0,alimiter=limit=0.95[mix]"
             ),
@@ -4746,11 +4779,11 @@ async def build_voice_reply_ogg(answer: str) -> bytes:
             "-c:a",
             "libopus",
             "-b:a",
-            "48k",
+            "64k",
             "-vbr",
             "on",
             "-application",
-            "voip",
+            "audio",
             "-ac",
             "1",
             "-ar",
@@ -4940,11 +4973,6 @@ async def voice_handler(
         except Exception:
             pass
 
-        await send_long_message(
-            update,
-            answer,
-        )
-
         audio_sent = await send_voice_answer_audio(
             message,
             answer,
@@ -4958,6 +4986,11 @@ async def voice_handler(
                     "voice_reply_audio",
                 )
             )
+
+        await send_long_message(
+            update,
+            answer,
+        )
 
         context.user_data.pop(
             "mode",
