@@ -179,12 +179,14 @@ openai_client = AsyncOpenAI(
 # Она используется дословно, без заголовка и вступления, чтобы TTS не
 # повторял первые слова молитвы.
 LORDS_PRAYER_PROJECT_RU = (
-    "Господи Отче, сущий на небесах, да святится имя Твое, "
-    "да придет Царствие Твое, да будет воля Твоя и на земле, как и на небе, "
-    "хлеб наш насущный подавай нам на каждый день, "
-    "и прости нам долги наши, как и мы прощаем должникам нашим, "
-    "и не введи нас во искушение, но избавь нас от лукавого, "
-    "ибо Твое есть Царство и сила и слава вовеки веков. Аминь."
+    "Отче, сущий на небесах. "
+    "Да святится имя Твоё. "
+    "Да придет Царствие Твоё. "
+    "Да будет воля Твоя и на земле, как и на небе. "
+    "Хлеб наш насущный подавай нам на каждый день. "
+    "И прости нам долги наши, как и мы прощаем должникам нашим. "
+    "И не введи нас во искушение, но избавь нас от лукавого. "
+    "Ибо Твоё есть Царство и сила и слава во веки веков. Аминь."
 )
 
 
@@ -4637,15 +4639,19 @@ async def create_tts_mp3(text: str) -> bytes:
         "Content-Type": "application/json",
         "Accept": "audio/mpeg",
     }
+    is_lords_prayer = (
+        prepare_tts_text(text) == LORDS_PRAYER_PROJECT_RU
+    )
+
     payload = {
         "text": text,
         "model_id": ELEVENLABS_MODEL_ID,
         "voice_settings": {
-            "stability": 0.72,
+            "stability": 0.82 if is_lords_prayer else 0.72,
             "similarity_boost": 0.80,
             "style": 0.0,
             "use_speaker_boost": True,
-            "speed": 0.98,
+            "speed": 0.86 if is_lords_prayer else 0.98,
         },
     }
     params = {
@@ -4768,6 +4774,8 @@ async def build_voice_reply_ogg(answer: str) -> bytes:
             + "\n\nПолный ответ отправлен вам также в текстовом виде."
         )
 
+    is_lords_prayer = (prepared == LORDS_PRAYER_PROJECT_RU)
+
     parts = split_tts_text(prepared)
     if not parts:
         raise ValueError("Нет текста для озвучивания")
@@ -4819,9 +4827,14 @@ async def build_voice_reply_ogg(answer: str) -> bytes:
             music_path,
             "-filter_complex",
             (
-                f"[1:a]volume={PRAYER_MUSIC_VOLUME},"
+                (
+                    "[0:a]adelay=1000|1000[voice];"
+                    if is_lords_prayer
+                    else "[0:a]anull[voice];"
+                )
+                + f"[1:a]volume={PRAYER_MUSIC_VOLUME},"
                 "highpass=f=55,lowpass=f=3600[music];"
-                "[0:a][music]amix=inputs=2:duration=first:"
+                "[voice][music]amix=inputs=2:duration=first:"
                 "dropout_transition=2:normalize=0,"
                 "alimiter=limit=0.95[mix]"
             ),
