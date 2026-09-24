@@ -66,24 +66,26 @@ VOICE_TRANSCRIPTION_MODEL = os.environ.get(
 ).strip() or "gpt-4o-transcribe"
 
 # Аудиоответ на входящее голосовое сообщение.
-# По умолчанию используется глубокий мужской голос Onyx и оригинальная
-# тихая инструментальная молитвенная подложка, генерируемая локально.
-VOICE_TTS_MODEL = os.environ.get(
-    "VOICE_TTS_MODEL",
-    "gpt-4o-mini-tts",
-).strip() or "gpt-4o-mini-tts"
-VOICE_TTS_VOICE = os.environ.get(
-    "VOICE_TTS_VOICE",
-    "onyx",
-).strip() or "onyx"
-VOICE_TTS_SPEED = 1.0
+# Озвучка через ElevenLabs, голос задаётся в Render через ELEVENLABS_VOICE_ID.
+ELEVENLABS_API_KEY = "".join(
+    os.environ.get("ELEVENLABS_API_KEY", "").split()
+)
+ELEVENLABS_VOICE_ID = "".join(
+    os.environ.get("ELEVENLABS_VOICE_ID", "").split()
+)
+ELEVENLABS_MODEL_ID = os.environ.get(
+    "ELEVENLABS_MODEL_ID",
+    "eleven_multilingual_v2",
+).strip() or "eleven_multilingual_v2"
 VOICE_TTS_MAX_CHARS = 1800
+VOICE_TTS_TOTAL_MAX_CHARS = 4500
 VOICE_TTS_TIMEOUT_SECONDS = 180.0
 VOICE_REPLY_FILENAME = "bibliya_otvechaet.ogg"
 PRAYER_MUSIC_PATH = os.path.join(
-    tempfile.gettempdir(),
-    "bibliya_otvechaet_prayer_pad_v3.wav",
+    os.path.dirname(os.path.abspath(__file__)),
+    "background_musik.m4a",
 )
+PRAYER_MUSIC_VOLUME = 0.12
 
 MAX_VOICE_DURATION_SECONDS = 600
 MAX_VOICE_FILE_BYTES = 20 * 1024 * 1024
@@ -4517,51 +4519,52 @@ def split_tts_text(
     return chunks
 
 
-async def create_tts_wav(text: str) -> bytes:
-    """Создаёт WAV-озвучку одной части ответа через OpenAI TTS."""
-    payload = {
-        "model": VOICE_TTS_MODEL,
-        "voice": VOICE_TTS_VOICE,
-        "input": text,
-        "instructions": (
-            "Говори на языке текста глубоким естественным мужским баритоном. "
-            "Голос взрослый, зрелый, спокойный, мудрый и очень приятный, "
-            "с близкой, тёплой подачей, будто человек говорит рядом, а не "
-            "читает дикторский текст. Держи низкий устойчивый регистр без "
-            "искусственного утяжеления голоса. Дикция должна быть образцово "
-            "чёткой: согласные, окончания, имена, числа, названия книг Библии, "
-            "главы и стихи произноси разборчиво и естественно. Не говори "
-            "роботизированно, монотонно, певуче или театрально. Не делай "
-            "одинаковые паузы после каждой фразы и не растягивай гласные. "
-            "Интонация живая, сдержанная и пастырская: спокойная уверенность, "
-            "сочувствие и внутренняя глубина без пафоса. Темп умеренный, "
-            "примерно как у хорошего взрослого рассказчика; важные духовные "
-            "фразы можно слегка замедлять, но общая речь должна оставаться "
-            "естественной. Если текст русский — используй нейтральное чистое "
-            "русское произношение без заметного акцента. Если текст на другом "
-            "языке — произноси его естественно для этого языка. Молитву и "
-            "Писание читай особенно спокойно, благоговейно и ясно."
-        ),
-        "response_format": "wav",
-        "speed": VOICE_TTS_SPEED,
-    }
+async def create_tts_mp3(text: str) -> bytes:
+    """Создаёт MP3-озвучку одной части ответа через ElevenLabs."""
+    if not ELEVENLABS_API_KEY:
+        raise RuntimeError(
+            "В Render отсутствует ELEVENLABS_API_KEY"
+        )
+    if not ELEVENLABS_VOICE_ID:
+        raise RuntimeError(
+            "В Render отсутствует ELEVENLABS_VOICE_ID"
+        )
 
     headers = {
-        "Authorization": f"Bearer {OPENAI_API_KEY}",
+        "xi-api-key": ELEVENLABS_API_KEY,
         "Content-Type": "application/json",
+        "Accept": "audio/mpeg",
     }
+    payload = {
+        "text": text,
+        "model_id": ELEVENLABS_MODEL_ID,
+    }
+    params = {
+        "output_format": "mp3_44100_128",
+    }
+
+    voice_id = quote(ELEVENLABS_VOICE_ID, safe="")
+    url = (
+        "https://api.elevenlabs.io/v1/text-to-speech/"
+        + voice_id
+    )
 
     async with httpx.AsyncClient(
         timeout=VOICE_TTS_TIMEOUT_SECONDS,
     ) as client:
         response = await client.post(
-            "https://api.openai.com/v1/audio/speech",
+            url,
             headers=headers,
+            params=params,
             json=payload,
         )
-        response.raise_for_status()
+        if response.is_error:
+            detail = response.text[:1200]
+            raise RuntimeError(
+                "ElevenLabs TTS error "
+                f"{response.status_code}: {detail}"
+            )
         return response.content
-
 
 def concatenate_tts_wavs(chunks: list[bytes]) -> bytes:
     """Склеивает WAV-части, вставляя короткую естественную паузу."""
@@ -4606,190 +4609,16 @@ def concatenate_tts_wavs(chunks: list[bytes]) -> bytes:
     return output.getvalue()
 
 
-def ensure_original_prayer_music() -> str:
-    """Создаёт мягкую оригинальную молитвенную подложку: pad + редкое piano."""
-    if (
-        os.path.exists(PRAYER_MUSIC_PATH)
-        and os.path.getsize(PRAYER_MUSIC_PATH) > 1000
-    ):
-        return PRAYER_MUSIC_PATH
-
-    sample_rate = 16000
-    chord_seconds = 12.0
-
-    # Тёплая спокойная гармония без яркого ритма.
-    chords = [
-        (65.41, 130.81, 164.81, 196.00, 246.94, 293.66),
-        (55.00, 110.00, 130.81, 164.81, 196.00, 246.94),
-        (43.65, 87.31, 130.81, 164.81, 220.00, 261.63),
-        (49.00, 98.00, 146.83, 196.00, 220.00, 293.66),
-    ]
-
-    piano_sets = [
-        (261.63, 329.63, 392.00, 493.88),
-        (220.00, 261.63, 329.63, 493.88),
-        (261.63, 329.63, 440.00, 523.25),
-        (293.66, 392.00, 440.00, 587.33),
-    ]
-    piano_offsets = (1.4, 4.3, 7.4, 10.1)
-
-    total_seconds = chord_seconds * len(chords)
-    total_samples = int(sample_rate * total_seconds)
-    mix = [0.0] * total_samples
-
-    # Мягкий sustained-pad с лёгкой детонацией, чтобы звук не был синтетически плоским.
-    for chord_index, chord in enumerate(chords):
-        start_sample = int(chord_index * chord_seconds * sample_rate)
-        end_sample = int((chord_index + 1) * chord_seconds * sample_rate)
-
-        for sample_index in range(start_sample, end_sample):
-            t = sample_index / sample_rate
-            local_t = t - chord_index * chord_seconds
-            fade = min(
-                1.0,
-                local_t / 2.2,
-                (chord_seconds - local_t) / 2.2,
-            )
-            fade = max(0.0, fade)
-            breathe = 0.93 + 0.07 * math.sin(
-                2.0 * math.pi * 0.032 * t
-                + chord_index * 0.7
-            )
-
-            pad = 0.0
-            for note_index, frequency in enumerate(chord):
-                phase = note_index * 0.58
-                pad += 0.26 * math.sin(
-                    2.0 * math.pi * frequency * t + phase
-                )
-                pad += 0.10 * math.sin(
-                    2.0 * math.pi * (frequency * 1.0032) * t
-                    + phase
-                    + 0.3
-                )
-                if frequency >= 100.0:
-                    pad += 0.055 * math.sin(
-                        2.0 * math.pi * (frequency * 2.0) * t
-                        + phase
-                        + 0.15
-                    )
-                    pad += 0.018 * math.sin(
-                        2.0 * math.pi * (frequency * 3.0) * t
-                        + phase
-                        + 0.35
-                    )
-
-            pad /= len(chord)
-
-            # Едва заметный воздушный слой: добавляет глубину без "колокольчиков".
-            air = (
-                0.018 * math.sin(2.0 * math.pi * 659.25 * t + 0.4)
-                + 0.012 * math.sin(2.0 * math.pi * 783.99 * t + 1.1)
-            )
-
-            mix[sample_index] += (
-                0.62 * pad * fade * breathe
-                + air * fade * breathe
-            )
-
-    # Редкие мягкие фортепианные ноты с коротким естественным "пространством".
-    for chord_index, notes in enumerate(piano_sets):
-        chord_start = chord_index * chord_seconds
-
-        for offset, frequency in zip(piano_offsets, notes):
-            onset = chord_start + offset
-            start_sample = int(onset * sample_rate)
-            note_samples = min(
-                int(5.0 * sample_rate),
-                total_samples - start_sample,
-            )
-
-            if note_samples <= 0:
-                continue
-
-            note = [0.0] * note_samples
-
-            for i in range(note_samples):
-                dt = i / sample_rate
-                envelope = (
-                    math.exp(-0.82 * dt)
-                    * (1.0 - math.exp(-20.0 * dt))
-                )
-
-                value = (
-                    1.00 * math.sin(2.0 * math.pi * frequency * dt)
-                    + 0.50 * math.sin(
-                        2.0 * math.pi * frequency * 2.0 * dt + 0.18
-                    )
-                    + 0.25 * math.sin(
-                        2.0 * math.pi * frequency * 3.0 * dt + 0.31
-                    )
-                    + 0.13 * math.sin(
-                        2.0 * math.pi * frequency * 4.0 * dt + 0.47
-                    )
-                    + 0.07 * math.sin(
-                        2.0 * math.pi * frequency * 5.0 * dt + 0.66
-                    )
-                    + 0.10 * math.sin(
-                        2.0 * math.pi * frequency * 0.997 * dt + 0.10
-                    )
-                )
-                note[i] = 0.20 * envelope * value
-
-            for i, value in enumerate(note):
-                mix[start_sample + i] += value
-
-            # Несколько тихих отражений создают мягкий реверберационный хвост.
-            for delay, decay in (
-                (0.10, 0.28),
-                (0.22, 0.17),
-                (0.39, 0.10),
-                (0.67, 0.05),
-            ):
-                delayed_start = int((onset + delay) * sample_rate)
-                available = total_samples - delayed_start
-                count = min(note_samples, max(0, available))
-
-                for i in range(count):
-                    mix[delayed_start + i] += decay * note[i]
-
-    samples = array("h")
-
-    for i, value in enumerate(mix):
-        t = i / sample_rate
-        fade_in = min(1.0, t / 2.0)
-        fade_out = min(
-            1.0,
-            (total_seconds - t) / 2.0,
+def ensure_prayer_music() -> str:
+    """Проверяет наличие музыкальной подложки из репозитория."""
+    if not os.path.exists(PRAYER_MUSIC_PATH):
+        raise FileNotFoundError(
+            "Не найден файл background_musik.m4a"
         )
-        value *= max(0.0, fade_in * fade_out)
-
-        # Уровень подобран так, чтобы музыка была слышима,
-        # но оставалась ниже голоса после финального микширования.
-        value *= 0.68
-        value = math.tanh(value * 1.03) / 1.03
-        pcm = int(32767 * value)
-        samples.append(max(-32768, min(32767, pcm)))
-
-    temp_path = (
-        PRAYER_MUSIC_PATH
-        + f".{os.getpid()}.{random.randint(1000, 9999)}.tmp"
-    )
-
-    try:
-        with wave.open(temp_path, "wb") as writer:
-            writer.setnchannels(1)
-            writer.setsampwidth(2)
-            writer.setframerate(sample_rate)
-            writer.writeframes(samples.tobytes())
-        os.replace(temp_path, PRAYER_MUSIC_PATH)
-    finally:
-        if os.path.exists(temp_path):
-            try:
-                os.remove(temp_path)
-            except OSError:
-                pass
-
+    if os.path.getsize(PRAYER_MUSIC_PATH) < 1000:
+        raise RuntimeError(
+            "Файл background_musik.m4a повреждён или пуст"
+        )
     return PRAYER_MUSIC_PATH
 
 def get_ffmpeg_executable() -> str:
@@ -4810,31 +4639,58 @@ def get_ffmpeg_executable() -> str:
 
 
 async def build_voice_reply_ogg(answer: str) -> bytes:
-    """Создаёт голосовой ответ с оригинальной тихой музыкальной подложкой."""
-    parts = split_tts_text(answer)
+    """Создаёт голосовой ответ ElevenLabs с тихой музыкальной подложкой."""
+    prepared = prepare_tts_text(answer)
+    if not prepared:
+        raise ValueError("Нет текста для озвучивания")
+
+    if len(prepared) > VOICE_TTS_TOTAL_MAX_CHARS:
+        shortened = prepared[:VOICE_TTS_TOTAL_MAX_CHARS]
+        cut = max(
+            shortened.rfind(". "),
+            shortened.rfind("! "),
+            shortened.rfind("? "),
+            shortened.rfind("\n"),
+        )
+        if cut >= int(VOICE_TTS_TOTAL_MAX_CHARS * 0.7):
+            shortened = shortened[: cut + 1]
+        prepared = (
+            shortened.rstrip()
+            + "\n\nПолный ответ отправлен вам также в текстовом виде."
+        )
+
+    parts = split_tts_text(prepared)
     if not parts:
         raise ValueError("Нет текста для озвучивания")
 
-    wav_parts: list[bytes] = []
-    for part in parts:
-        wav_parts.append(
-            await create_tts_wav(part)
-        )
-
-    voice_wav = concatenate_tts_wavs(wav_parts)
-    music_path = await asyncio.to_thread(
-        ensure_original_prayer_music
-    )
+    music_path = await asyncio.to_thread(ensure_prayer_music)
     ffmpeg = get_ffmpeg_executable()
 
     with tempfile.TemporaryDirectory(
         prefix="bibliya_audio_",
     ) as temp_dir:
-        voice_path = os.path.join(temp_dir, "voice.wav")
-        output_path = os.path.join(temp_dir, VOICE_REPLY_FILENAME)
+        voice_paths: list[str] = []
 
-        with open(voice_path, "wb") as file:
-            file.write(voice_wav)
+        for index, part in enumerate(parts):
+            audio = await create_tts_mp3(part)
+            part_path = os.path.join(
+                temp_dir,
+                f"voice_{index:03d}.mp3",
+            )
+            with open(part_path, "wb") as file:
+                file.write(audio)
+            voice_paths.append(part_path)
+
+        concat_path = os.path.join(temp_dir, "voice_parts.txt")
+        with open(concat_path, "w", encoding="utf-8") as file:
+            for part_path in voice_paths:
+                escaped = part_path.replace("'", "'\\''")
+                file.write(f"file '{escaped}'\n")
+
+        output_path = os.path.join(
+            temp_dir,
+            VOICE_REPLY_FILENAME,
+        )
 
         command = [
             ffmpeg,
@@ -4842,17 +4698,23 @@ async def build_voice_reply_ogg(answer: str) -> bytes:
             "-loglevel",
             "error",
             "-y",
+            "-f",
+            "concat",
+            "-safe",
+            "0",
             "-i",
-            voice_path,
+            concat_path,
             "-stream_loop",
             "-1",
             "-i",
             music_path,
             "-filter_complex",
             (
-                "[1:a]volume=0.45,highpass=f=55,lowpass=f=3600[music];"
+                f"[1:a]volume={PRAYER_MUSIC_VOLUME},"
+                "highpass=f=55,lowpass=f=3600[music];"
                 "[0:a][music]amix=inputs=2:duration=first:"
-                "dropout_transition=2:normalize=0,alimiter=limit=0.95[mix]"
+                "dropout_transition=2:normalize=0,"
+                "alimiter=limit=0.95[mix]"
             ),
             "-map",
             "[mix]",
@@ -4891,7 +4753,6 @@ async def build_voice_reply_ogg(answer: str) -> bytes:
 
         with open(output_path, "rb") as file:
             return file.read()
-
 
 async def send_voice_answer_audio(
     message,
