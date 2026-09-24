@@ -93,6 +93,8 @@ VOICE_PARAGRAPH_PAUSE_SECONDS = 0.90
 VOICE_LINE_PAUSE_SECONDS = 0.55
 VOICE_CHUNK_PAUSE_SECONDS = 0.60
 VOICE_MAX_INLINE_BREAKS = 14
+VOICE_RUSSIAN_STRESS_EDITOR_ENABLED = True
+VOICE_RUSSIAN_STRESS_MAX_TOKENS = 1400
 VOICE_REPLY_FILENAME = "bibliya_otvechaet.ogg"
 PRAYER_MUSIC_PATH = os.path.join(
     os.path.dirname(os.path.abspath(__file__)),
@@ -344,6 +346,12 @@ BASE_INSTRUCTIONS = """
 или точное название молитвы,
 если оно действительно нужно.
 Исключение — «Отче наш»: для неё действует правило 6Г.
+
+6Ж. Русский текст молитв, псалмов и библейских цитат
+должен быть орфографически, пунктуационно и синтаксически нормативным.
+Не искажай слова ради озвучки в видимом сообщении:
+специальная орфоэпическая разметка выполняется только
+во внутренней аудиокопии текста.
 
 ТОЧНОСТЬ ПИСАНИЯ
 
@@ -4821,6 +4829,111 @@ def prepare_tts_prosody_text(text: str) -> str:
     return " ".join(part for part in result if part).strip()
 
 
+
+_RUSSIAN_CYRILLIC_RE = re.compile(r"[А-Яа-яЁё]")
+
+
+def _only_case_changed(original: str, edited: str) -> bool:
+    """
+    Разрешает орфоэпическому редактору менять ТОЛЬКО регистр букв.
+    Любое изменение слов, пунктуации, пробелов или порядка текста отклоняется.
+    """
+    return original.casefold() == edited.casefold()
+
+
+def _apply_known_biblical_stress_overrides(text: str) -> str:
+    """
+    Контекстные исправления для слов, которые особенно легко прочитать
+    с неверным ударением. Эти замены влияют только на TTS-копию текста.
+    """
+    # Псалом 90 (Синодальный перевод):
+    # «от стрелы, летящей днем» — здесь «стрелы́» (род. п., ед. ч.),
+    # а не «стре́лы» (им. п., мн. ч.).
+    text = re.sub(
+        r"(?i)\bстрелы(?=\s*,?\s*летящей\b)",
+        lambda m: "стрелЫ" if m.group(0).islower() else "СтрелЫ",
+        text,
+    )
+
+    return text
+
+
+async def prepare_russian_pronunciation_for_tts(text: str) -> str:
+    """
+    Контекстно размечает русские ударения для ElevenLabs.
+    В аудио-копии ударная гласная делается прописной:
+    ElevenLabs рекомендует изменение написания/регистра как способ
+    принудительно уточнять произношение на моделях без русских IPA-правил.
+
+    Безопасность:
+    - видимый пользователю текст не меняется;
+    - редактору запрещено менять слова и пунктуацию;
+    - результат принимается только если отличается исходно ТОЛЬКО регистром;
+    - при любой ошибке используем исходный текст + встроенные точечные правила.
+    """
+    original = prepare_tts_text(text)
+    if not original:
+        return ""
+
+    fallback = _apply_known_biblical_stress_overrides(original)
+
+    if (
+        not VOICE_RUSSIAN_STRESS_EDITOR_ENABLED
+        or not OPENAI_API_KEY
+        or not _RUSSIAN_CYRILLIC_RE.search(original)
+    ):
+        return fallback
+
+    instructions = """
+Ты — профессиональный русский орфоэпист и редактор речи.
+Твоя единственная задача — подготовить РОВНО тот же русский текст
+для синтеза речи, правильно указав ударения.
+
+СТРОГИЕ ПРАВИЛА:
+1. НЕЛЬЗЯ менять, удалять, добавлять или переставлять слова.
+2. НЕЛЬЗЯ менять знаки препинания, пробелы, переносы строк и цифры.
+3. НЕЛЬЗЯ исправлять стиль, орфографию, богословие или перевод.
+4. Разрешено ТОЛЬКО менять регистр одной ударной гласной внутри русского слова:
+   например: «стрелы» в значении родительного падежа единственного числа
+   перед «летящей» -> «стрелЫ».
+5. Для каждого многосложного русского слова выбери нормативное ударение
+   по контексту. Особенно внимательно обрабатывай омографы,
+   библейские имена, географические названия, архаизмы,
+   церковную и синодальную лексику.
+6. Буква «ё» уже указывает ударение; не заменяй её на «е».
+7. Не выделяй целое слово прописными буквами — только ударную гласную.
+8. Если слово односложное, регистр не меняй.
+9. Никаких пояснений, Markdown, кавычек вокруг ответа и комментариев.
+10. Верни только исходный текст с орфоэпической разметкой регистра.
+
+Примеры:
+«от стрелы, летящей днем» -> «от стрелЫ, летЯщей днём»
+«Иисус Христос» -> «ИисУс ХристОс»
+"""
+    try:
+        response = await openai_client.responses.create(
+            model=MODEL,
+            instructions=instructions,
+            input=original,
+            max_output_tokens=VOICE_RUSSIAN_STRESS_MAX_TOKENS,
+        )
+        edited = (response.output_text or "").strip()
+
+        # Модель не имеет права менять сам текст — только регистр.
+        if edited and _only_case_changed(original, edited):
+            return _apply_known_biblical_stress_overrides(edited)
+
+        logger.warning(
+            "Орфоэпическая разметка отклонена: редактор изменил текст, "
+            "используется безопасный fallback."
+        )
+    except Exception:
+        logger.exception(
+            "Не удалось выполнить орфоэпическую разметку русского TTS"
+        )
+
+    return fallback
+
 def split_tts_text(
     text: str,
     max_chars: int = VOICE_TTS_MAX_CHARS,
@@ -4871,7 +4984,8 @@ async def create_tts_mp3(
     plain = prepare_tts_text(text)
     is_lords_prayer = (plain == LORDS_PRAYER_PROJECT_RU)
 
-    speech_text = prepare_tts_prosody_text(plain)
+    pronunciation_text = await prepare_russian_pronunciation_for_tts(plain)
+    speech_text = prepare_tts_prosody_text(pronunciation_text)
     if trailing_pause:
         speech_text += (
             f' <break time="{VOICE_CHUNK_PAUSE_SECONDS:.2f}s" />'
@@ -4892,6 +5006,8 @@ async def create_tts_mp3(
     payload = {
         "text": speech_text,
         "model_id": ELEVENLABS_MODEL_ID,
+        "language_code": "ru",
+        "apply_text_normalization": "on",
         "voice_settings": {
             "stability": 0.84 if (is_lords_prayer or liturgical) else 0.79,
             "similarity_boost": 0.80,
