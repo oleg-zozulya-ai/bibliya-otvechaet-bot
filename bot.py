@@ -84,9 +84,15 @@ VOICE_TTS_MAX_CHARS = 1800
 VOICE_TTS_TOTAL_MAX_CHARS = 1700
 VOICE_TTS_TIMEOUT_SECONDS = 180.0
 VOICE_GENERAL_SPEED = 0.90
+VOICE_LITURGICAL_SPEED = 0.87
 VOICE_LORDS_PRAYER_SPEED = 0.86
 VOICE_GENERAL_INTRO_DELAY_MS = 2000
 VOICE_LORDS_PRAYER_INTRO_DELAY_MS = 2000
+VOICE_TITLE_PAUSE_SECONDS = 2.0
+VOICE_PARAGRAPH_PAUSE_SECONDS = 0.90
+VOICE_LINE_PAUSE_SECONDS = 0.55
+VOICE_CHUNK_PAUSE_SECONDS = 0.60
+VOICE_MAX_INLINE_BREAKS = 14
 VOICE_REPLY_FILENAME = "bibliya_otvechaet.ogg"
 PRAYER_MUSIC_PATH = os.path.join(
     os.path.dirname(os.path.abspath(__file__)),
@@ -316,6 +322,28 @@ BASE_INSTRUCTIONS = """
 Используй проектную формулировку,
 заданную в приложении,
 дословно и без изменений.
+
+6Д. Если пользователь просит прочитать или произнести
+псалом, молитву или другой молитвенный текст,
+оформляй его для грамотного устного чтения.
+Название псалма или молитвы ставь отдельной строкой.
+После названия делай пустую строку,
+а сам текст начинай с нового абзаца.
+Не склеивай заголовок и первое предложение.
+Сохраняй нормативную русскую пунктуацию,
+смысловые абзацы и естественное членение фраз.
+Не добавляй искусственные многоточия ради пауз.
+Не вставляй номера стихов внутрь произносимого текста,
+если пользователь прямо не попросил читать номера стихов.
+
+6Е. Если читается псалом,
+используй краткий заголовок вида «Псалом 90-й»,
+«Псалом 121-й» и затем начинай текст с нового абзаца.
+Если читается обычная молитва,
+используй отдельный короткий заголовок «Молитва»
+или точное название молитвы,
+если оно действительно нужно.
+Исключение — «Отче наш»: для неё действует правило 6Г.
 
 ТОЧНОСТЬ ПИСАНИЯ
 
@@ -4594,11 +4622,210 @@ def prepare_tts_text(text: str) -> str:
     return cleaned.strip()
 
 
+_RU_ORDINAL_1_19 = {
+    1: "первый",
+    2: "второй",
+    3: "третий",
+    4: "четвёртый",
+    5: "пятый",
+    6: "шестой",
+    7: "седьмой",
+    8: "восьмой",
+    9: "девятый",
+    10: "десятый",
+    11: "одиннадцатый",
+    12: "двенадцатый",
+    13: "тринадцатый",
+    14: "четырнадцатый",
+    15: "пятнадцатый",
+    16: "шестнадцатый",
+    17: "семнадцатый",
+    18: "восемнадцатый",
+    19: "девятнадцатый",
+}
+
+_RU_TENS_CARDINAL = {
+    20: "двадцать",
+    30: "тридцать",
+    40: "сорок",
+    50: "пятьдесят",
+    60: "шестьдесят",
+    70: "семьдесят",
+    80: "восемьдесят",
+    90: "девяносто",
+}
+
+_RU_TENS_ORDINAL = {
+    20: "двадцатый",
+    30: "тридцатый",
+    40: "сороковой",
+    50: "пятидесятый",
+    60: "шестидесятый",
+    70: "семидесятый",
+    80: "восьмидесятый",
+    90: "девяностый",
+}
+
+
+def russian_ordinal_masculine(number: int) -> str:
+    """Даёт нормативное русское порядковое числительное для псалмов 1–150."""
+    if number in _RU_ORDINAL_1_19:
+        return _RU_ORDINAL_1_19[number]
+
+    if 20 <= number < 100:
+        tens = (number // 10) * 10
+        units = number % 10
+        if units == 0:
+            return _RU_TENS_ORDINAL[tens]
+        return f"{_RU_TENS_CARDINAL[tens]} {_RU_ORDINAL_1_19[units]}"
+
+    if number == 100:
+        return "сотый"
+
+    if 100 < number <= 150:
+        rest = number - 100
+        return f"сто {russian_ordinal_masculine(rest)}"
+
+    return str(number)
+
+
+def _normalize_psalm_title_for_speech(title: str) -> str:
+    """Преобразует «Псалом 90-й» в устойчивое для Flash v2.5 «Псалом девяностый»."""
+    match = re.search(r"(?i)\bпсалом\s+(\d{1,3})", title)
+    if not match:
+        return title.strip().rstrip(".:;—-")
+
+    number = int(match.group(1))
+    spoken_number = russian_ordinal_masculine(number)
+    return f"Псалом {spoken_number}"
+
+
+def is_liturgical_recitation(text: str) -> bool:
+    """Определяет чтение псалма/молитвы, чтобы не ускорять и не сокращать его."""
+    prepared = prepare_tts_text(text)
+    if not prepared:
+        return False
+
+    if prepared == LORDS_PRAYER_PROJECT_RU:
+        return True
+
+    first = prepared.lstrip().splitlines()[0].strip().lower()
+
+    if re.match(r"^псалом\s+\d{1,3}(?:\s*[-‑–—]?\s*(?:й|ый|ой|ий))?\b", first):
+        return True
+
+    if first == "молитва" or re.match(
+        r"^молитва\s+(?:за|о|об|перед|после|при|на|для)\b",
+        first,
+    ):
+        return True
+
+    return False
+
+
+def prepare_tts_prosody_text(text: str) -> str:
+    """
+    Добавляет точные паузы для ElevenLabs Flash v2.5.
+    SSML break используется умеренно: после заголовков, абзацев и строк.
+    """
+    plain = prepare_tts_text(text)
+    if not plain:
+        return ""
+
+    lines = plain.splitlines()
+    result: list[str] = []
+    inline_breaks = 0
+
+    def add_break(seconds: float) -> None:
+        nonlocal inline_breaks
+        if inline_breaks >= VOICE_MAX_INLINE_BREAKS:
+            return
+        result.append(f'<break time="{seconds:.2f}s" />')
+        inline_breaks += 1
+
+    for index, raw_line in enumerate(lines):
+        line = raw_line.strip()
+
+        if not line:
+            if result and inline_breaks < VOICE_MAX_INLINE_BREAKS:
+                # Не дублируем подряд несколько пауз.
+                if not result[-1].startswith("<break "):
+                    add_break(VOICE_PARAGRAPH_PAUSE_SECONDS)
+            continue
+
+        # Псалом: заголовок произносится отдельно, затем точная пауза 2 секунды.
+        psalm = re.match(
+            r"(?i)^псалом\s+(\d{1,3})"
+            r"(?:\s*[-‑–—]?\s*(?:й|ый|ой|ий))?"
+            r"\s*[.:;—-]?\s*(.*)$",
+            line,
+        )
+        if psalm:
+            title = _normalize_psalm_title_for_speech(
+                f"Псалом {psalm.group(1)}"
+            )
+            rest = psalm.group(2).strip()
+
+            result.append(title + ".")
+            add_break(VOICE_TITLE_PAUSE_SECONDS)
+
+            if rest:
+                result.append(rest)
+
+            continue
+
+        # Заголовок молитвы в той же строке:
+        # «Молитва за семью: Господь...» -> заголовок, 2 сек., текст.
+        prayer_inline = re.match(
+            r"(?i)^(молитва"
+            r"(?:\s+(?:за|о|об|перед|после|при|на|для)\b"
+            r"[^.:;!?]{0,70})?)"
+            r"\s*[.:]\s*(.+)$",
+            line,
+        )
+        if prayer_inline:
+            title = prayer_inline.group(1).strip()
+            rest = prayer_inline.group(2).strip()
+            result.append(title.rstrip(".:") + ".")
+            add_break(VOICE_TITLE_PAUSE_SECONDS)
+            if rest:
+                result.append(rest)
+            continue
+
+        # Отдельная строка-заголовок молитвы.
+        lower = line.lower().rstrip(".:")
+        is_prayer_heading = (
+            lower == "молитва"
+            or (
+                len(line) <= 90
+                and re.match(
+                    r"^молитва\s+(?:за|о|об|перед|после|при|на|для)\b",
+                    lower,
+                )
+            )
+        )
+        if is_prayer_heading:
+            result.append(line.rstrip(".:") + ".")
+            add_break(VOICE_TITLE_PAUSE_SECONDS)
+            continue
+
+        result.append(line)
+
+        # Смысловая пауза между соседними строками, но не чрезмерно.
+        if index + 1 < len(lines):
+            next_line = lines[index + 1]
+            if next_line.strip():
+                add_break(VOICE_LINE_PAUSE_SECONDS)
+
+    # SSML-теги отделяем пробелами, чтобы они не склеивались со словами.
+    return " ".join(part for part in result if part).strip()
+
+
 def split_tts_text(
     text: str,
     max_chars: int = VOICE_TTS_MAX_CHARS,
 ) -> list[str]:
-    """Делит длинный ответ на безопасные части для TTS API."""
+    """Делит длинный ответ на безопасные смысловые части для TTS API."""
     remaining = prepare_tts_text(text)
     chunks: list[str] = []
 
@@ -4611,7 +4838,8 @@ def split_tts_text(
         candidate = remaining[:max_chars]
         split_at = -1
 
-        for delimiter in ("\n\n", "\n", ". ", "! ", "? ", "; ", ", ", " "):
+        # Сначала абзац/предложение, и только затем более слабые границы.
+        for delimiter in ("\n\n", "\n", ". ", "! ", "? ", "; ", ": ", ", ", " "):
             pos = candidate.rfind(delimiter, search_start)
             if pos > split_at:
                 split_at = pos + len(delimiter)
@@ -4628,21 +4856,33 @@ def split_tts_text(
     return chunks
 
 
-async def create_tts_mp3(text: str) -> bytes:
+async def create_tts_mp3(
+    text: str,
+    *,
+    liturgical: bool = False,
+    trailing_pause: bool = False,
+) -> bytes:
     """Озвучивает текст только через ElevenLabs выбранным Pastor Russian."""
     if not ELEVENLABS_API_KEY:
         raise RuntimeError("В Render отсутствует ELEVENLABS_API_KEY")
     if not ELEVENLABS_VOICE_ID:
         raise RuntimeError("В Render отсутствует ELEVENLABS_VOICE_ID")
 
-    is_lords_prayer = (
-        prepare_tts_text(text) == LORDS_PRAYER_PROJECT_RU
-    )
-    speed = (
-        VOICE_LORDS_PRAYER_SPEED
-        if is_lords_prayer
-        else VOICE_GENERAL_SPEED
-    )
+    plain = prepare_tts_text(text)
+    is_lords_prayer = (plain == LORDS_PRAYER_PROJECT_RU)
+
+    speech_text = prepare_tts_prosody_text(plain)
+    if trailing_pause:
+        speech_text += (
+            f' <break time="{VOICE_CHUNK_PAUSE_SECONDS:.2f}s" />'
+        )
+
+    if is_lords_prayer:
+        speed = VOICE_LORDS_PRAYER_SPEED
+    elif liturgical:
+        speed = VOICE_LITURGICAL_SPEED
+    else:
+        speed = VOICE_GENERAL_SPEED
 
     headers = {
         "xi-api-key": ELEVENLABS_API_KEY,
@@ -4650,10 +4890,10 @@ async def create_tts_mp3(text: str) -> bytes:
         "Accept": "audio/mpeg",
     }
     payload = {
-        "text": text,
+        "text": speech_text,
         "model_id": ELEVENLABS_MODEL_ID,
         "voice_settings": {
-            "stability": 0.84 if is_lords_prayer else 0.79,
+            "stability": 0.84 if (is_lords_prayer or liturgical) else 0.79,
             "similarity_boost": 0.80,
             "style": 0.0,
             "use_speaker_boost": True,
@@ -4712,7 +4952,8 @@ async def make_spoken_answer(answer: str) -> str:
     prepared = prepare_tts_text(answer)
     if not prepared:
         return ""
-    if prepared == LORDS_PRAYER_PROJECT_RU:
+    if is_liturgical_recitation(prepared):
+        # Псалмы и молитвы читаются как есть: без пересказа и сокращения.
         return prepared
     if len(prepared) <= VOICE_TTS_TOTAL_MAX_CHARS:
         return prepared
@@ -4723,9 +4964,11 @@ async def make_spoken_answer(answer: str) -> str:
 Сохрани главную библейскую мысль, 1–3 ключевых места Писания и практическое
 ободрение. Удали заголовки, эмодзи, длинные списки и повторы. Не добавляй
 новых фактов и не меняй богословский смысл. Русский язык. Манера зрелого
-пастора: тёплая, спокойная, размеренная. Короткие предложения и естественные
-паузы. Итог — примерно 900–1400 знаков, максимум 1600 знаков. Верни только
-текст для озвучки без пояснений.
+пастора: тёплая, спокойная, размеренная. Короткие предложения, нормативная
+русская пунктуация, ясные смысловые абзацы и естественные паузы. Не сливай
+заголовок с первым предложением. Не используй искусственные многоточия для
+имитации пауз. Итог — примерно 900–1400 знаков, максимум 1600 знаков. Верни
+только текст для озвучки без пояснений.
 """
     try:
         response = await openai_client.responses.create(
@@ -4830,6 +5073,7 @@ async def build_voice_reply_ogg(answer: str) -> bytes:
         raise ValueError("Нет текста для озвучивания")
 
     is_lords_prayer = (prepared == LORDS_PRAYER_PROJECT_RU)
+    is_liturgical = is_liturgical_recitation(prepared)
     intro_delay_ms = (
         VOICE_LORDS_PRAYER_INTRO_DELAY_MS
         if is_lords_prayer
@@ -4847,7 +5091,11 @@ async def build_voice_reply_ogg(answer: str) -> bytes:
         voice_paths: list[str] = []
 
         for index, part in enumerate(parts):
-            audio = await create_tts_mp3(part)
+            audio = await create_tts_mp3(
+                part,
+                liturgical=is_liturgical,
+                trailing_pause=(index < len(parts) - 1),
+            )
             part_path = os.path.join(temp_dir, f"voice_{index:03d}.mp3")
             with open(part_path, "wb") as file:
                 file.write(audio)
@@ -4933,16 +5181,6 @@ async def send_voice_answer_audio(
         "🎧 Готовлю аудиоответ..."
     )
 
-    disclosure_needed = True
-
-    if telegram_user_id:
-        try:
-            disclosure_needed = not await analytics_has_event(
-                telegram_user_id,
-                "voice_ai_disclosure_shown",
-            )
-        except Exception:
-            disclosure_needed = True
 
     try:
         audio = await build_voice_reply_ogg(answer)
@@ -4961,11 +5199,6 @@ async def send_voice_answer_audio(
             caption=caption,
         )
 
-        if disclosure_needed and telegram_user_id:
-            await analytics_log_event(
-                telegram_user_id,
-                "voice_ai_disclosure_shown",
-            )
 
         return True
 
