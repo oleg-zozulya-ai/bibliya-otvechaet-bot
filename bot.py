@@ -66,7 +66,7 @@ VOICE_TRANSCRIPTION_MODEL = os.environ.get(
 ).strip() or "gpt-4o-transcribe"
 
 # Аудиоответ на входящее голосовое сообщение.
-# По умолчанию используется взрослый мужской голос Cedar и оригинальная
+# По умолчанию используется глубокий мужской голос Onyx и оригинальная
 # тихая инструментальная молитвенная подложка, генерируемая локально.
 VOICE_TTS_MODEL = os.environ.get(
     "VOICE_TTS_MODEL",
@@ -74,15 +74,15 @@ VOICE_TTS_MODEL = os.environ.get(
 ).strip() or "gpt-4o-mini-tts"
 VOICE_TTS_VOICE = os.environ.get(
     "VOICE_TTS_VOICE",
-    "cedar",
-).strip() or "cedar"
+    "onyx",
+).strip() or "onyx"
 VOICE_TTS_SPEED = 1.0
-VOICE_TTS_MAX_CHARS = 2400
+VOICE_TTS_MAX_CHARS = 1800
 VOICE_TTS_TIMEOUT_SECONDS = 180.0
 VOICE_REPLY_FILENAME = "bibliya_otvechaet.ogg"
 PRAYER_MUSIC_PATH = os.path.join(
     tempfile.gettempdir(),
-    "bibliya_otvechaet_prayer_pad_v2.wav",
+    "bibliya_otvechaet_prayer_pad_v3.wav",
 )
 
 MAX_VOICE_DURATION_SECONDS = 600
@@ -4524,18 +4524,23 @@ async def create_tts_wav(text: str) -> bytes:
         "voice": VOICE_TTS_VOICE,
         "input": text,
         "instructions": (
-            "Говори на языке текста естественным взрослым мужским голосом. "
-            "Голос зрелый, спокойный, мудрый, тёплый и уверенный, как у "
-            "внимательного пастырского собеседника. Дикция должна быть "
-            "очень чёткой: ясно произноси окончания, имена, числа, названия "
-            "книг Библии и ссылки на главы и стихи. Не говори роботизированно, "
-            "не растягивай гласные, не делай механических пауз и не используй "
-            "театральную или рекламную манеру. Темп естественный, немного "
-            "созерцательный, но не медленный. Делай короткие живые паузы "
-            "только по смыслу. Если текст русский — используй нейтральное "
-            "естественное русское произношение; если текст на другом языке — "
-            "произноси его естественно для этого языка. Молитву и места "
-            "Писания читай особенно бережно, спокойно и с достоинством."
+            "Говори на языке текста глубоким естественным мужским баритоном. "
+            "Голос взрослый, зрелый, спокойный, мудрый и очень приятный, "
+            "с близкой, тёплой подачей, будто человек говорит рядом, а не "
+            "читает дикторский текст. Держи низкий устойчивый регистр без "
+            "искусственного утяжеления голоса. Дикция должна быть образцово "
+            "чёткой: согласные, окончания, имена, числа, названия книг Библии, "
+            "главы и стихи произноси разборчиво и естественно. Не говори "
+            "роботизированно, монотонно, певуче или театрально. Не делай "
+            "одинаковые паузы после каждой фразы и не растягивай гласные. "
+            "Интонация живая, сдержанная и пастырская: спокойная уверенность, "
+            "сочувствие и внутренняя глубина без пафоса. Темп умеренный, "
+            "примерно как у хорошего взрослого рассказчика; важные духовные "
+            "фразы можно слегка замедлять, но общая речь должна оставаться "
+            "естественной. Если текст русский — используй нейтральное чистое "
+            "русское произношение без заметного акцента. Если текст на другом "
+            "языке — произноси его естественно для этого языка. Молитву и "
+            "Писание читай особенно спокойно, благоговейно и ясно."
         ),
         "response_format": "wav",
         "speed": VOICE_TTS_SPEED,
@@ -4602,94 +4607,169 @@ def concatenate_tts_wavs(chunks: list[bytes]) -> bytes:
 
 
 def ensure_original_prayer_music() -> str:
-    """Создаёт собственную спокойную молитвенную музыкальную петлю."""
+    """Создаёт мягкую оригинальную молитвенную подложку: pad + редкое piano."""
     if (
         os.path.exists(PRAYER_MUSIC_PATH)
         and os.path.getsize(PRAYER_MUSIC_PATH) > 1000
     ):
         return PRAYER_MUSIC_PATH
 
-    sample_rate = 24000
-    chord_seconds = 8.0
+    sample_rate = 16000
+    chord_seconds = 12.0
 
-    # Мягкая гармония: Cmaj7 -> Am7 -> Fmaj7 -> Gsus4.
+    # Тёплая спокойная гармония без яркого ритма.
     chords = [
-        (130.81, 164.81, 196.00, 246.94),
-        (110.00, 130.81, 164.81, 196.00),
-        (87.31, 130.81, 164.81, 220.00),
-        (98.00, 130.81, 146.83, 196.00),
+        (65.41, 130.81, 164.81, 196.00, 246.94, 293.66),
+        (55.00, 110.00, 130.81, 164.81, 196.00, 246.94),
+        (43.65, 87.31, 130.81, 164.81, 220.00, 261.63),
+        (49.00, 98.00, 146.83, 196.00, 220.00, 293.66),
     ]
 
-    # Редкие верхние ноты дают ощущение спокойного фортепиано/колокольчика.
-    bell_notes = [
-        (2.0, 523.25),
-        (6.0, 659.25),
-        (10.0, 493.88),
-        (14.0, 440.00),
-        (18.0, 523.25),
-        (22.0, 659.25),
-        (26.0, 587.33),
-        (30.0, 523.25),
+    piano_sets = [
+        (261.63, 329.63, 392.00, 493.88),
+        (220.00, 261.63, 329.63, 493.88),
+        (261.63, 329.63, 440.00, 523.25),
+        (293.66, 392.00, 440.00, 587.33),
     ]
+    piano_offsets = (1.4, 4.3, 7.4, 10.1)
 
-    samples = array("h")
     total_seconds = chord_seconds * len(chords)
     total_samples = int(sample_rate * total_seconds)
+    mix = [0.0] * total_samples
 
-    for i in range(total_samples):
-        t = i / sample_rate
-        chord_index = min(int(t // chord_seconds), len(chords) - 1)
-        local_t = t - chord_index * chord_seconds
-        chord = chords[chord_index]
+    # Мягкий sustained-pad с лёгкой детонацией, чтобы звук не был синтетически плоским.
+    for chord_index, chord in enumerate(chords):
+        start_sample = int(chord_index * chord_seconds * sample_rate)
+        end_sample = int((chord_index + 1) * chord_seconds * sample_rate)
 
-        edge = min(
-            1.0,
-            local_t / 1.8,
-            (chord_seconds - local_t) / 1.8,
-        )
-        edge = max(0.0, edge)
-
-        slow_breathe = 0.90 + 0.10 * math.sin(
-            2.0 * math.pi * 0.045 * t
-        )
-
-        pad = 0.0
-        for note_index, frequency in enumerate(chord):
-            phase = note_index * 0.55
-            pad += 0.62 * math.sin(
-                2.0 * math.pi * frequency * t + phase
+        for sample_index in range(start_sample, end_sample):
+            t = sample_index / sample_rate
+            local_t = t - chord_index * chord_seconds
+            fade = min(
+                1.0,
+                local_t / 2.2,
+                (chord_seconds - local_t) / 2.2,
             )
-            pad += 0.13 * math.sin(
-                2.0 * math.pi * frequency * 2.0 * t + phase
+            fade = max(0.0, fade)
+            breathe = 0.93 + 0.07 * math.sin(
+                2.0 * math.pi * 0.032 * t
+                + chord_index * 0.7
             )
 
-        pad /= 4.0
-
-        # Очень мягкий низ без гула.
-        root = 0.20 * math.sin(
-            2.0 * math.pi * (chord[0] / 2.0) * t
-        )
-
-        bell = 0.0
-        for onset, frequency in bell_notes:
-            dt = t - onset
-            if 0.0 <= dt <= 2.5:
-                envelope = math.exp(-2.2 * dt)
-                bell += envelope * (
-                    0.70 * math.sin(2.0 * math.pi * frequency * dt)
-                    + 0.20 * math.sin(
-                        2.0 * math.pi * frequency * 2.0 * dt
+            pad = 0.0
+            for note_index, frequency in enumerate(chord):
+                phase = note_index * 0.58
+                pad += 0.26 * math.sin(
+                    2.0 * math.pi * frequency * t + phase
+                )
+                pad += 0.10 * math.sin(
+                    2.0 * math.pi * (frequency * 1.0032) * t
+                    + phase
+                    + 0.3
+                )
+                if frequency >= 100.0:
+                    pad += 0.055 * math.sin(
+                        2.0 * math.pi * (frequency * 2.0) * t
+                        + phase
+                        + 0.15
                     )
+                    pad += 0.018 * math.sin(
+                        2.0 * math.pi * (frequency * 3.0) * t
+                        + phase
+                        + 0.35
+                    )
+
+            pad /= len(chord)
+
+            # Едва заметный воздушный слой: добавляет глубину без "колокольчиков".
+            air = (
+                0.018 * math.sin(2.0 * math.pi * 659.25 * t + 0.4)
+                + 0.012 * math.sin(2.0 * math.pi * 783.99 * t + 1.1)
+            )
+
+            mix[sample_index] += (
+                0.62 * pad * fade * breathe
+                + air * fade * breathe
+            )
+
+    # Редкие мягкие фортепианные ноты с коротким естественным "пространством".
+    for chord_index, notes in enumerate(piano_sets):
+        chord_start = chord_index * chord_seconds
+
+        for offset, frequency in zip(piano_offsets, notes):
+            onset = chord_start + offset
+            start_sample = int(onset * sample_rate)
+            note_samples = min(
+                int(5.0 * sample_rate),
+                total_samples - start_sample,
+            )
+
+            if note_samples <= 0:
+                continue
+
+            note = [0.0] * note_samples
+
+            for i in range(note_samples):
+                dt = i / sample_rate
+                envelope = (
+                    math.exp(-0.82 * dt)
+                    * (1.0 - math.exp(-20.0 * dt))
                 )
 
-        tone = (
-            0.78 * pad * edge * slow_breathe
-            + 0.12 * root * edge
-            + 0.10 * bell
-        )
+                value = (
+                    1.00 * math.sin(2.0 * math.pi * frequency * dt)
+                    + 0.50 * math.sin(
+                        2.0 * math.pi * frequency * 2.0 * dt + 0.18
+                    )
+                    + 0.25 * math.sin(
+                        2.0 * math.pi * frequency * 3.0 * dt + 0.31
+                    )
+                    + 0.13 * math.sin(
+                        2.0 * math.pi * frequency * 4.0 * dt + 0.47
+                    )
+                    + 0.07 * math.sin(
+                        2.0 * math.pi * frequency * 5.0 * dt + 0.66
+                    )
+                    + 0.10 * math.sin(
+                        2.0 * math.pi * frequency * 0.997 * dt + 0.10
+                    )
+                )
+                note[i] = 0.20 * envelope * value
 
-        value = int(32767 * 0.085 * tone)
-        samples.append(max(-32768, min(32767, value)))
+            for i, value in enumerate(note):
+                mix[start_sample + i] += value
+
+            # Несколько тихих отражений создают мягкий реверберационный хвост.
+            for delay, decay in (
+                (0.10, 0.28),
+                (0.22, 0.17),
+                (0.39, 0.10),
+                (0.67, 0.05),
+            ):
+                delayed_start = int((onset + delay) * sample_rate)
+                available = total_samples - delayed_start
+                count = min(note_samples, max(0, available))
+
+                for i in range(count):
+                    mix[delayed_start + i] += decay * note[i]
+
+    samples = array("h")
+
+    for i, value in enumerate(mix):
+        t = i / sample_rate
+        fade_in = min(1.0, t / 2.0)
+        fade_out = min(
+            1.0,
+            (total_seconds - t) / 2.0,
+        )
+        value *= max(0.0, fade_in * fade_out)
+
+        # Уровень подобран так, чтобы музыка была слышима,
+        # но оставалась ниже голоса после финального микширования.
+        value *= 0.68
+        value = math.tanh(value * 1.03) / 1.03
+        pcm = int(32767 * value)
+        samples.append(max(-32768, min(32767, pcm)))
 
     temp_path = (
         PRAYER_MUSIC_PATH
@@ -4770,7 +4850,7 @@ async def build_voice_reply_ogg(answer: str) -> bytes:
             music_path,
             "-filter_complex",
             (
-                "[1:a]volume=0.13,highpass=f=70,lowpass=f=4200[music];"
+                "[1:a]volume=0.45,highpass=f=55,lowpass=f=3600[music];"
                 "[0:a][music]amix=inputs=2:duration=first:"
                 "dropout_transition=2:normalize=0,alimiter=limit=0.95[mix]"
             ),
