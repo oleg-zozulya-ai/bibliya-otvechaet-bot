@@ -92,7 +92,7 @@ PRAYER_MUSIC_PATH = os.path.join(
     os.path.dirname(os.path.abspath(__file__)),
     "background_musik.m4a",
 )
-PRAYER_MUSIC_VOLUME = 0.16
+PRAYER_MUSIC_VOLUME = 0.19
 
 MAX_VOICE_DURATION_SECONDS = 600
 MAX_VOICE_FILE_BYTES = 20 * 1024 * 1024
